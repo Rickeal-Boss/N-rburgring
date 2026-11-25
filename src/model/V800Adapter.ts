@@ -2290,9 +2290,13 @@ export function createV800CarAdapter(tier: QualityTier = 'high', paintId: string
         tireMeshes.push(m);
       }
     });
-    if (tireMeshes.some((m) => m.geometry.type === 'LatheGeometry')) {
+    // N-rburgring：真胎在 R3 后已由 LatheGeometry 变为 BufferGeometry（spec 回转体
+    // 经工厂内部转 Buffer），旧判据 `type === 'LatheGeometry'` 恒不命中 ⇒ 占位块不隐藏。
+    // 改按「非 ExtrudeGeometry」判真胎：占位件是圆角 extrude（ExtrudeGeometry），真胎是
+    // BufferGeometry。只要存在任一非 extrude 胎件，就把所有 extrude 胎件隐藏。
+    if (tireMeshes.some((m) => m.geometry.type !== 'ExtrudeGeometry')) {
       for (const m of tireMeshes) {
-        if (m.geometry.type === 'LatheGeometry') continue; // 真胎，保留
+        if (m.geometry.type !== 'ExtrudeGeometry') continue; // 真胎，保留
         m.visible = false;
         m.castShadow = false;
       }
@@ -2364,6 +2368,30 @@ export function createV800CarAdapter(tier: QualityTier = 'high', paintId: string
     for (const c of moved) hub.attach(c);
     pivot.updateMatrixWorld(true);
     wheels.push({ spin: hub, pivot, basePos: [pivot.position.x, pivot.position.y, pivot.position.z] });
+  }
+
+  /* N-rburgring · 胎圈对位（用户「确保轮胎与车轮对得上」）：
+   * 外部轮圈 GLB 是单件轮圈（探针实测 bbox 0.31×0.85×0.87），程序化真胎宽 0.55
+   * （0.55×0.77×0.81）⇒ 原样显胎会向车外侧各凸 12cm、穿出轮拱。按轮圈宽收窄轴向
+   * 0.58×、半径补 1.02×（胎肩包住轮圈外缘）。占位胎（ExtrudeGeometry）再次兜底隐藏
+   * （上面的隐藏块若因 spec 变动漏判，这里仍保证不出现方块）。 */
+  for (const w of wheels) {
+    w.spin.traverse((o) => {
+      const m = o as THREE.Mesh;
+      if (!m.isMesh) return;
+      const mats = Array.isArray(m.material) ? m.material : [m.material];
+      const isTire = mats.some(
+        (mt) =>
+          (mt as THREE.MeshPhysicalMaterial | undefined)?.userData?.sculptMaterial?.id === 'tire'
+      );
+      if (!isTire) return;
+      if (m.geometry.type === 'ExtrudeGeometry') {
+        m.visible = false;
+        m.castShadow = false;
+        return;
+      }
+      m.scale.set(0.58, 1.02, 1.02);
+    });
   }
 
   // 注：辐条 InstancedMesh 已从 spec 整体删除（原 4 个系统 80 实例 = 15,360 面，
@@ -5307,7 +5335,9 @@ const R48_LAMP_TONE: boolean =
         matEntries.push({
           mat: mt,
           cabinHidable: ud?.cabinHidable === true,
-          kept: id != null && R44_INTERIOR_MATERIAL_IDS.has(id),
+          // N-rburgring：外部轮 GLB（wheel-l.glb）是**轮圈**单件（单材质金属、无贴图），
+          // 橡胶胎必须由程序化胎承担 ⇒ tire 材质进 kept，否则壳就绪后轮拱里只剩金属盘。
+          kept: id != null && (id === 'tire' || R44_INTERIOR_MATERIAL_IDS.has(id)),
         });
       }
       // —— 网格级 tag ——

@@ -42,18 +42,27 @@ export const DRIVE_MODEL = {
   refSpeedMs: 5.5,
   /** 低速最大前轮转角 rad（34°） */
   steerLowRad: (34 * Math.PI) / 180,
-  /** 高速最大前轮转角 rad（6°） */
-  steerHighRad: (6 * Math.PI) / 180,
-  /** 转角收窄区间（km/h） */
+  /**
+   * 高速最大前轮转角 rad —— D2 手感校准：6°(0.1047) → **0.48 rad（27.5°）**。
+   * 旧仓 FREE 表口径：满舵转动量随速收窄的是**响应**，不是把方向盘变成微调旋钮；
+   * 6° 在 120km/h 只剩 0.1rad，转向像「坏了的助力」。0.48 配合下面 60km/h 的收窄
+   * 上限，高速真正的限幅来自摩擦圆（gripLat / v），不是转角表（见文件头第 3 步）。
+   */
+  steerHighRad: 0.48,
+  /** 转角收窄区间（km/h）：18 → 60（旧仓 FREE 表；120 时仍按满收窄值 0.48 处理） */
   steerLowKmh: 18,
-  steerHighKmh: 120,
+  steerHighKmh: 60,
   /** 转向输入一阶时间常数（低速/高速） */
   steerTauLow: 0.07,
   steerTauHigh: 0.14,
   /** caster 自回正：回正方向 τ 比率 */
   steerReturnRatio: 0.7,
-  /** 横摆响应一阶滞后 s */
-  yawResponseTau: 0.22,
+  /**
+   * 横摆响应一阶滞后 s —— D2：0.22 → **0.07**。
+   * 0.22 是「打舵后要等 ~0.7s 车头才转」的橡皮感；涡扇电车该跟手。
+   * 高频抖动由转向输入自身的一阶 τ（0.07/0.14）+ 摩擦圆钳制兜住，不靠这里。
+   */
+  yawResponseTau: 0.07,
   /** 手刹后轴抓地下限 */
   driftGripFloor: 0.32,
   /** 后轴抓地衰减/恢复时间常数 */
@@ -195,7 +204,7 @@ export function suspensionTarget(
   return Math.sign(input) * mag;
 }
 
-/** 速度敏感转角上限（18km/h 34° → 120km/h 6°，中间线性） */
+/** 速度敏感转角上限（18km/h 34° → 60km/h 27.5°(0.48rad)，中间线性；D2 校准） */
 export function steerLimitFor(speedKmh: number): number {
   const t = clamp(
     (speedKmh - DRIVE_MODEL.steerLowKmh) / (DRIVE_MODEL.steerHighKmh - DRIVE_MODEL.steerLowKmh),

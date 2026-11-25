@@ -3,27 +3,59 @@
  *
  * 密度纪律（P0）：树、岩石、里程牌全部 InstancedMesh，单类 1 个 draw call；
  * 远景一律 castShadow=false（只剩起点建筑群近景投影）。总数：
- *   树 ~1736（每侧 24m 交错，|x| ∈ [16,55]）、岩石 300（|x| ∈ [20,120]）、
- *   里程牌 21、弯道提示牌 8、起点建筑 6 件、远景废墟 8 组（合并成 2 个 mesh）。
+ *   树 ~2600（每侧 16m 交错，|x| ∈ [16,55]，D2 由 24m 加密）、岩石 300、
+ *   里程牌 21、弯道提示牌 8、起点建筑 6 件、远景废墟 8 组（合并成 1 个 mesh）。
  *
  * 落地真源：全部用 `terrainPoint()`（Landscape.ts 导出）取高程 —— 与地形网格顶点
  * 逐点同源，改剖面不会让树浮空/埋土。
+ *
+ * 石材（D2）：起点建筑群/废墟改用程序化 **ashlar 石砌贴图**（`scene/ashlarTexture`）。
+ * 原先复用土路肩的 soil 噪点图，放大到 60m 墙 / 14m 塔身时已看不出砌块（读成纯色）。
  */
 import * as THREE from 'three';
 import { getTrack } from '../track/nordschleife';
 import { mergeSafe } from '../util/geo';
 import { makeLcg } from '../util/math';
 import { terrainPoint } from './Landscape';
-import { createSoilTexture } from './scene/roadTexture';
+import { createAshlarTexture } from './scene/ashlarTexture';
 
-/** 起点建筑/废墟石材（土壤噪点当石纹，色相由 color 给） */
-function stoneMaterial(soil: THREE.Texture): THREE.MeshStandardMaterial {
+/** 起点建筑/废墟石材（ashlar 错缝砖贴图，色相/明度由 color 给） */
+function stoneMaterial(ashlar: THREE.Texture): THREE.MeshStandardMaterial {
   return new THREE.MeshStandardMaterial({
-    map: soil,
-    color: 0xb9b1a6,
+    map: ashlar,
+    color: 0xd8d2c8,
     roughness: 0.88,
     metalness: 0.03
   });
+}
+
+/** 石砌贴图一个 repeat 对应的世界尺寸 m（256² = 4 砖宽 × 6 皮 ⇒ 砖宽 1m、皮高 0.43m） */
+const ASHLAR_TILE_M = 4;
+
+/**
+ * 把 BoxGeometry 的 6 个面 UV 按**实际边长**缩放 —— 否则 60m 维修墙与 8m 塔身
+ * 共用同一张 0..1 UV，砌块尺度会差 7 倍（墙上是巨大石块、塔上是碎砖）。
+ * 面序（three.js）：+x, −x, +y, −y, +z, −z，各 4 顶点。
+ */
+function scaleBoxUv(geo: THREE.BufferGeometry, w: number, h: number, d: number): void {
+  const uv = geo.getAttribute('uv') as THREE.BufferAttribute;
+  const spans: ReadonlyArray<readonly [number, number]> = [
+    [d, h],
+    [d, h], // ±x：u 沿 depth、v 沿 height
+    [w, d],
+    [w, d], // ±y：u 沿 width、v 沿 depth
+    [w, h],
+    [w, h] // ±z：u 沿 width、v 沿 height
+  ];
+  for (let f = 0; f < 6; f++) {
+    const su = spans[f][0] / ASHLAR_TILE_M;
+    const sv = spans[f][1] / ASHLAR_TILE_M;
+    for (let i = 0; i < 4; i++) {
+      const idx = f * 4 + i;
+      uv.setXY(idx, uv.getX(idx) * su, uv.getY(idx) * sv);
+    }
+  }
+  uv.needsUpdate = true;
 }
 
 /** 世界系盒体（沿赛道局部坐标系摆放）：底面对齐地形 + yOff */
@@ -38,6 +70,7 @@ function boxAt(
   const track = getTrack();
   const f = track.at(s);
   const geo = new THREE.BoxGeometry(w, h, d);
+  scaleBoxUv(geo, w, h, d);
   const right = new THREE.Vector3(f.right.x, f.right.y, f.right.z);
   const up = new THREE.Vector3(f.up.x, f.up.y, f.up.z);
   const tangent = new THREE.Vector3(f.tangent.x, f.tangent.y, f.tangent.z);
@@ -62,10 +95,12 @@ export class Scenery {
     const L = track.length;
 
     /* ── 树：树干 cylinder + 树冠（两锥合并）────────────────────────────
-     * 每侧 24m 一棵、左右交错 12m；确定性 LCG 抖动位置/缩放/朝向。
-     * 单实例 12（干）+ 28（冠）= 40 tri（规格 40~70）。 */
+     * D2：每侧 **16m** 一棵（原先 24m）、左右交错 8m；确定性 LCG 抖动位置/缩放/朝向。
+     * 总数 = floor(L/16)*2 ≈ 2602，仍是 2 个 InstancedMesh（树干 / 树冠）。
+     * 单实例 12（干）+ 28（冠）= 40 tri。 */
     const rnd = makeLcg(80820832);
-    const perSide = Math.floor(L / 24);
+    const TREE_SPACING = 16;
+    const perSide = Math.floor(L / TREE_SPACING);
     const treeCount = perSide * 2;
     const trunkGeo = new THREE.CylinderGeometry(0.18, 0.26, 2.6, 6, 1, true);
     trunkGeo.translate(0, 1.3, 0);
@@ -76,8 +111,8 @@ export class Scenery {
     const canopyGeo = mergeSafe([coneA, coneB]);
     this.geometries.push(trunkGeo, canopyGeo);
 
-    const trunkMat = new THREE.MeshStandardMaterial({ color: 0x584434, roughness: 0.95 });
-    const canopyMat = new THREE.MeshStandardMaterial({ color: 0xe8f0e0, roughness: 0.92 });
+    const trunkMat = new THREE.MeshStandardMaterial({ color: 0x4a3a2c, roughness: 0.95 });
+    const canopyMat = new THREE.MeshStandardMaterial({ color: 0x8a9a72, roughness: 0.92 });
     this.materials.push(trunkMat, canopyMat);
 
     const trunks = new THREE.InstancedMesh(trunkGeo, trunkMat, treeCount);
@@ -98,7 +133,7 @@ export class Scenery {
     let ti = 0;
     for (const side of [-1, 1]) {
       for (let i = 0; i < perSide; i++) {
-        const s = i * 24 + (side > 0 ? 12 : 0) + (rnd() - 0.5) * 10;
+        const s = i * TREE_SPACING + (side > 0 ? TREE_SPACING / 2 : 0) + (rnd() - 0.5) * 8;
         const lateral = side * (16 + rnd() * 39);
         const scale = 0.75 + rnd() * 0.6;
         terrainPoint(s, lateral, p);
@@ -109,8 +144,9 @@ export class Scenery {
         m.compose(p, q, sc);
         trunks.setMatrixAt(ti, m);
         canopies.setMatrixAt(ti, m);
-        // 冠色：灰绿 → 深绿（同一材质靠 instanceColor 分化，零额外 DC）
-        col.setHSL(0.26 + rnd() * 0.05, 0.34 + rnd() * 0.16, 0.15 + rnd() * 0.09);
+        // 冠色（D2）：灰绿 → 深橄榄，明度 0.14~0.22 / 饱和 0.25~0.40（线性空间；
+        // 乘上 canopyMat 0x8a9a72 后落在暗橄榄，不再是荧光浅绿）
+        col.setHSL(0.24 + rnd() * 0.06, 0.25 + rnd() * 0.15, 0.14 + rnd() * 0.08);
         canopies.setColorAt(ti, col);
         ti++;
       }
@@ -153,12 +189,11 @@ export class Scenery {
     this.buildMarkers(group, rnd);
 
     /* ── 起点建筑群（石砌看台 / 维修墙 / 双塔）+ 远景废墟 ─────────────── */
-    const soil = createSoilTexture();
-    soil.wrapS = THREE.RepeatWrapping;
-    soil.wrapT = THREE.RepeatWrapping;
-    soil.repeat.set(2, 2);
-    this.textures.push(soil);
-    const stone = stoneMaterial(soil);
+    const ashlar = createAshlarTexture();
+    // UV 已按实际边长换算成米 ⇒ 贴图 repeat 保持 1（见 scaleBoxUv / ASHLAR_TILE_M）
+    ashlar.repeat.set(1, 1);
+    this.textures.push(ashlar);
+    const stone = stoneMaterial(ashlar);
     this.materials.push(stone);
 
     // 起点建筑群：近景投影（castShadow=true）
