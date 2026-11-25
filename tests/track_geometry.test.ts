@@ -79,3 +79,23 @@ describe('nordschleife centerline', () => {
     expect(found).toBe(true);
   });
 });
+
+describe('track frames orthonormal', () => {
+  const track = new Nordschleife();
+  it('up is unit, perpendicular to tangent, and stays near vertical everywhere', () => {
+    for (let s = 0; s < track.length; s += 37) {
+      const f = track.at(s);
+      const t = { ...f.tangent };
+      const r = { ...f.right };
+      const u = { ...f.up };
+      const dot = t.x * u.x + t.y * u.y + t.z * u.z;
+      expect(Math.abs(dot)).toBeLessThan(1e-3);
+      expect(Math.hypot(u.x, u.y, u.z)).toBeCloseTo(1, 6);
+      expect(Math.hypot(r.x, r.y, r.z)).toBeCloseTo(1, 6);
+      // 坡度最大 18%，up.y 理论下限 ≈ cos(atan(0.18))=0.984；留 0.95 裕量
+      expect(u.y).toBeGreaterThan(0.95);
+      const tr = t.x * r.x + t.y * r.y + t.z * r.z;
+      expect(Math.abs(tr)).toBeLessThan(1e-3);
+    }
+  });
+});

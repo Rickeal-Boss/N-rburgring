@@ -39,6 +39,7 @@ import { ContactShadow } from '../render/scene/ContactShadow';
 import { Environment } from '../render/scene/Environment';
 import { Lighting } from '../render/scene/Lighting';
 import { FarHills } from '../render/FarHills';
+import { Landmarks } from '../render/Landmarks';
 import { Landscape } from '../render/Landscape';
 import { Scenery } from '../render/Scenery';
 import { Track } from '../render/Track';
@@ -88,6 +89,8 @@ export class Game {
   private readonly landscape: Landscape;
   private readonly farHills: FarHills;
   private readonly scenery: Scenery;
+  /** D3：程序化白石城堡地标（大门 ×2 / 塔群 ×3 / 主殿 ×1） */
+  private readonly landmarks: Landmarks;
   private readonly car: CarLike;
   private readonly profile = getVehicleProfile(resolveVehicleId());
   private readonly tier: QualitySettings['tier'];
@@ -172,6 +175,8 @@ export class Game {
     this.landscape = new Landscape(this.scene);
     this.farHills = new FarHills(this.scene);
     this.scenery = new Scenery(this.scene);
+    // D3 地标：低质量档连近景大门也降装饰密度（几何尺寸不变）
+    this.landmarks = new Landmarks(this.scene, this.tier === 'low');
 
     // 车（只保留 V800：外部壳异步挂载，加载屏由 pollLoadGate 控制）
     this.car = createV800CarAdapter(this.tier, resolveAssemblyPaintId(this.profile.id) ?? undefined);
@@ -644,6 +649,7 @@ export class Game {
     this.landscape.dispose();
     this.farHills.dispose();
     this.scenery.dispose();
+    this.landmarks.dispose();
     this.car.dispose();
     this.renderer.dispose();
   }

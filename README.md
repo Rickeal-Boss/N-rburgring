@@ -5,9 +5,11 @@ Vite + TypeScript + three.js 程序化三维赛道。**20.83 km 纽博格林北�
 
 - 赛道：106 个手工路点经闭合 Catmull–Rom 插值 + 等弧长重采样，全长 **20 831.6 m**，
   最小曲率半径 28.6 m，最大坡度 < 18%，含 Hohe Acht 高点 / Fuchsröhre 下坡 / Karussell 台地横倾。
-- 画面：石板铺装、白石路缘、土路肩、护栏、树木/岩石/废墟全部程序化；沿用原项目的石材贴图、
-  车漆、天空/雾/光照/后处理与音效体系。
-- 车辆：仅尊界 V800 高精度模型（程序化车身 + GLB 车轮装配）。
+- 画面：石板铺装、白石路缘、土路肩、护栏、树木/岩石/远山全部程序化；**低密度白石城堡地标**
+  （城门 ×2 跨路、城堡复合体 ×3、主殿 ×1，移植自旧仓 castleKit 的 `makeGate/makeTowerGroup/makeMainHall`）；
+  沿用原项目的石材贴图、车漆、天空/雾/光照/后处理与音效体系。
+- 车辆：仅尊界 V800 高精度模型（程序化车身 + GLB 车轮装配）；**轮胎与轮圈轴向严格对齐**
+  （胎/圈轴向包围盒同为 0.24m、半径 0.439m，四轮一致）。
 - 玩法：W/S 油门刹车、A/D 转向、Space 手刹、C 切机位、R 回赛道、Esc 暂停；
   过起终线计圈，记录本圈/最佳/三段分段，最佳成绩存 localStorage。
 
@@ -37,8 +39,13 @@ npm test         # vitest
 src/track/nordschleife.ts   中心线/坐标架/closestS（纯数据）
 src/render/Track.ts         路面/路缘/路肩/护栏/起终线
 src/render/Landscape.ts     横向剖面地形
+src/render/FarHills.ts      远山天际线
 src/render/Scenery.ts       树/岩石/公里牌/起点建筑群
+src/render/Landmarks.ts     白石城堡地标（城门/城堡/主殿）摆放
+src/render/scene/castleKit.ts  程序化城堡构件库（旧仓移植）
 src/core/Drive.ts           驾驶模型（自行车模型 + 抓地钳 + 手刹漂移）
 src/core/LapTimer.ts        圈速/分段/最佳
+src/core/AutoPilot.ts       #autodrive 自动巡游（QA）
+src/ui/Hud.ts               圈速 HUD + 小地图
 src/core/Game.ts            装配与帧循环
 ```

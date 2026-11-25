@@ -168,6 +168,21 @@ const MAX_WHEEL_STEP_PER_FRAME = (Math.PI / 20) * 0.9;
 /** 仪表重绘最小间隔（s）→ 15Hz 上限，避免 512×288 Canvas 每帧重绘 + 纹理上传 */
 const GAUGE_MIN_INTERVAL = 1 / 15;
 
+/**
+ * 程序化真胎对齐外部轮圈的缩放（D2 P0「轮胎与车轮对得上」）。
+ *
+ * ⚠ 轴向由**探针实测**钉死，别再凭「X 是宽度」的直觉改：
+ *   真胎 geometry localSize = 0.764 × 0.255 × 0.764 ⇒ **宽度在局部 Y**，半径在 X/Z
+ *   （Z 与 X 同值才是圆胎；回转体绕轮轴转过 ~45°，X/Z 不同因子会直接变斜椭圆）。
+ *   外部轮圈（wheel-*.glb）bbox = 0.31 宽 × 0.85~0.88 直径。
+ *
+ * 取值：半径 1.16 ⇒ 直径 0.886（比轮圈大 ~8mm，胎肩包住轮圈外缘、不露金属边）；
+ *      宽度 1.29 ⇒ 胎宽 0.329（比轮圈宽 1cm，两侧各盖一点）。
+ * 微调范围 ±0.03，以肉眼不穿轮拱/不露地缝为准。
+ */
+const TIRE_RADIUS_SCALE = 1.15;
+const TIRE_WIDTH_SCALE = 0.94;
+
 /* ── R71 · 高精度方向盘极近距门控（根治主驾相机黑帧）──────────────────────────
  * 根因：52k-tri 高精盘挂 body 下随俯仰/侧倾，而 cabin 相机只随偏航（Game.ts 不随 body
  *   俯仰侧倾）、near=0.05 ⇒ 相机移动时盘面扫过近平面 ⇒ 整帧闪烁/黑帧。
@@ -2294,11 +2309,18 @@ export function createV800CarAdapter(tier: QualityTier = 'high', paintId: string
     // 经工厂内部转 Buffer），旧判据 `type === 'LatheGeometry'` 恒不命中 ⇒ 占位块不隐藏。
     // 改按「非 ExtrudeGeometry」判真胎：占位件是圆角 extrude（ExtrudeGeometry），真胎是
     // BufferGeometry。只要存在任一非 extrude 胎件，就把所有 extrude 胎件隐藏。
+    // ⚠ 只置 visible=false 不够：占位件材质 id='tire' 有 sculpt id ⇒ 建表 hasId=true ⇒
+    //   applyVisibility pass 2 每帧 `mesh.visible = true` 又把它显回来（D2 P0 实测：
+    //   hiddenPlaceholders=0）。因此同时打 `r44PlaceholderTire` 标记，让状态表按
+    //   「恒隐藏」处置（见 MeshEntry.hiddenAlways）。
     if (tireMeshes.some((m) => m.geometry.type !== 'ExtrudeGeometry')) {
       for (const m of tireMeshes) {
-        if (m.geometry.type !== 'ExtrudeGeometry') continue; // 真胎，保留
+        // 名字 /^车轮 / 的也是占位件（「轮胎 *」才是真胎，两者不可混淆）
+        const placeholder = m.geometry.type === 'ExtrudeGeometry' || /^车轮 /.test(m.name);
+        if (!placeholder) continue;
         m.visible = false;
         m.castShadow = false;
+        m.userData.r44PlaceholderTire = true;
       }
     }
   }
@@ -2371,10 +2393,22 @@ export function createV800CarAdapter(tier: QualityTier = 'high', paintId: string
   }
 
   /* N-rburgring · 胎圈对位（用户「确保轮胎与车轮对得上」）：
-   * 外部轮圈 GLB 是单件轮圈（探针实测 bbox 0.31×0.85×0.87），程序化真胎宽 0.55
-   * （0.55×0.77×0.81）⇒ 原样显胎会向车外侧各凸 12cm、穿出轮拱。按轮圈宽收窄轴向
-   * 0.58×、半径补 1.02×（胎肩包住轮圈外缘）。占位胎（ExtrudeGeometry）再次兜底隐藏
-   * （上面的隐藏块若因 spec 变动漏判，这里仍保证不出现方块）。 */
+   *
+   * 探针实测（`.qa/nr/d2/tire_probe.json`，CDP 直读 geometry + matrixWorld）：
+   *   · 程序化真胎「轮胎 *」localSize = **0.764 × 0.255 × 0.764** —— 回转体被工厂转了
+   *     90°，**宽度在局部 Y**、半径在局部 X/Z（两者同值才是圆胎）；
+   *   · 外部轮圈 wheel-*.glb bbox = 0.31（宽）× 0.85~0.88（直径）；
+   *   · 真胎原始半径 0.382 < 轮圈半径 0.435 ⇒ 金属盘从橡胶外缘探出来 = 「轮子掉了」。
+   *
+   * ⚠ 历史坑（本轮 P0 的第二个真因）：先前写成 `scale.set(0.58, 1.02, 1.02)`（把 X 当宽度）
+   *   ⇒ X/Z 两个半径轴一个被压到 0.58、一个留 1.02 = **椭圆胎**，且回转体绕轮轴转了 ~45°，
+   *   侧视里胎呈「斜椭圆」。因此半径必须 **X=Z 同因子**，宽度单独给 Y。
+   *
+   * 取值（可 ±0.03 微调，以不穿轮拱为准）：
+   *   TIRE_RADIUS_SCALE 1.16 ⇒ 直径 0.764×1.16 = 0.886 > 轮圈 0.87（胎肩包住轮圈外缘 ~8mm）；
+   *   TIRE_WIDTH_SCALE  1.29 ⇒ 胎宽 0.255×1.29 = 0.329 > 轮圈 0.31（两侧各盖 1cm）。
+   * 占位胎（ExtrudeGeometry）再次兜底隐藏 —— 但**光设 visible 不够**（状态表会显回来），
+   * 必须同时打 r44PlaceholderTire 标记（见上方隐藏块与 MeshEntry.hiddenAlways）。 */
   for (const w of wheels) {
     w.spin.traverse((o) => {
       const m = o as THREE.Mesh;
@@ -2388,9 +2422,10 @@ export function createV800CarAdapter(tier: QualityTier = 'high', paintId: string
       if (m.geometry.type === 'ExtrudeGeometry') {
         m.visible = false;
         m.castShadow = false;
+        m.userData.r44PlaceholderTire = true; // 同上一块：进状态表按「恒隐藏」处置
         return;
       }
-      m.scale.set(0.58, 1.02, 1.02);
+      m.scale.set(TIRE_RADIUS_SCALE, TIRE_WIDTH_SCALE, TIRE_RADIUS_SCALE);
     });
   }
 
@@ -5296,6 +5331,14 @@ const R48_LAMP_TONE: boolean =
     isPoke: boolean;
     /** cabin 方块内饰（id 白名单 / keepByName≠welcome-carpet）——外景藏（#r47cabin=off 不藏）。 */
     isBlock: boolean;
+    /**
+     * 装配期判定为**占位件**（车轮占位 extrude 方块，userData.r44PlaceholderTire）——
+     * 任何相机态 / 任何壳状态都恒隐藏。
+     * 为什么必须单列：占位件材质 id='tire' 有 sculpt id ⇒ hasId=true，pass 2 的
+     * `!hasId && !keepByName` 分支管不到它，会走 `v=true` 每帧把它显回来
+     * （D2 P0 实测 hiddenPlaceholders=0 = 4 个方块盖住轮圈）。
+     */
+    hiddenAlways: boolean;
     /** ① 风挡（glass-clear）——cabin 藏（R14：从车内看前挡糊成灰板）。 */
     windshield: boolean;
     /** ② 内舱暗面 exterior/interior **克隆引用**（存「用哪支」，非布尔标量）。 */
@@ -5412,6 +5455,7 @@ const R48_LAMP_TONE: boolean =
         cabinHidable: cabinHidableMesh,
         isPoke,
         isBlock,
+        hiddenAlways: (mesh.userData as { r44PlaceholderTire?: boolean }).r44PlaceholderTire === true,
         windshield,
         pair: pairByMesh.get(mesh) ?? null,
       });
@@ -5465,6 +5509,12 @@ const R48_LAMP_TONE: boolean =
     // —— pass 2 · 网格级（后）：mesh.visible + 暗面材质引用 全量覆盖 ——
     for (const e of meshEntries) {
       if (e.cabinHidable) continue; // 材质级已管（座舱遮挡），mesh 恒可见
+      // ⓪ 占位件（车轮占位 extrude 方块）：任何状态恒隐藏。必须排在最前 ——
+      //   它 hasId=true（材质 id='tire'），落到下面通用的 `v=true` 会被重新显回来。
+      if (e.hiddenAlways) {
+        e.mesh.visible = false;
+        continue;
+      }
       // ③ id-less 且非 keep ⇒ shell ready 后永久隐藏（含程序化车牌；高精盘不入表）
       if (!e.hasId && !e.keepByName) { e.mesh.visible = !exteriorShellReady; continue; }
       let v = true;

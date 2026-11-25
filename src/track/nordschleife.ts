@@ -267,9 +267,12 @@ export class Nordschleife {
       rx[i] = rxv;
       ry[i] = 0;
       rz[i] = rzv;
-      // up = tangent × right（右手系；反了会让路面上下颠倒、横倾符号翻转）
+      // up = tangent × right = (dy·rz, dz·rx − dx·rz, −dy·rx)
+      // ⚠ y 分量必须同时含 dz·rx 与 −dx·rz 两项：只写 dz·rx 时，东西向路段
+      //   （dx 大、dz 小）在有任何坡度时 up 会严重偏离竖直（实测 s=13200 达 37.8°），
+      //   凡用 makeBasis(right, up, tangent) 摆的建筑会被拧歪。
       ux[i] = dy * rzv;
-      uy[i] = dz * rxv;
+      uy[i] = dz * rxv - dx * rzv;
       uz[i] = -dy * rxv;
       const ul = Math.hypot(ux[i], uy[i], uz[i]) || 1;
       ux[i] /= ul;
@@ -394,6 +397,20 @@ export class Nordschleife {
     out.curvature = this.curv[i0] + (this.curv[i1] - this.curv[i0]) * t;
     out.grade = this.gradeArr[i0] + (this.gradeArr[i1] - this.gradeArr[i0]) * t;
     out.bank = this.bankArr[i0] + (this.bankArr[i1] - this.bankArr[i0]) * t;
+    // 相邻采样线性插值不是精确单位向量（实测最大 5e-5 偏差）——对外统一归一，
+    // 否则 makeBasis(right, up, tangent) 摆出的建筑会有极轻微剪切。
+    const tn = Math.hypot(out.tangent.x, out.tangent.y, out.tangent.z) || 1;
+    out.tangent.x /= tn;
+    out.tangent.y /= tn;
+    out.tangent.z /= tn;
+    const rn3 = Math.hypot(out.right.x, out.right.y, out.right.z) || 1;
+    out.right.x /= rn3;
+    out.right.y /= rn3;
+    out.right.z /= rn3;
+    const un = Math.hypot(out.up.x, out.up.y, out.up.z) || 1;
+    out.up.x /= un;
+    out.up.y /= un;
+    out.up.z /= un;
     return out;
   }
 

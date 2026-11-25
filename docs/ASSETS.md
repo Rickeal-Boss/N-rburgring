@@ -1,6 +1,8 @@
-# 资产许可登记表 — 极限刹车挑战 · 尊界V800
+# 资产许可登记表 — 纽博格林北环 · 自由驾驶（N-rburgring）
 
-登记人：理资（资产与许可管理员） · 核对日期：2026-10-14 · 工程版本：package.json v0.2.0
+登记人：理资（资产与许可管理员） · 核对日期：2026-11-25 · 工程版本：package.json v0.1.0
+
+> 本仓由 `Ultimate-Design-V800` 复制改造：已删除 cannon-es 依赖与刹停玩法物理；新增赛道/地形/地标均为程序化生成。
 
 **结论先行：程序化资产为零外部依赖；仓库曾入库的 12 张第三方官方宣传图裁片已于 2026-10-14 全部移除（第 7 节）；2026-10-18 依仓库所有者指令新增 6 张「参考图衍生贴图」（第 9 节，逐项登记，仅非商业个人演示用途）。** 模型几何 / 音效 / 环境贴图仍全部程序化生成（自制），npm 依赖许可已逐项核实。来源不明资产清单为空。
 
@@ -15,9 +17,9 @@
 | 资源加载调用（`load(`/`Loader`/`fetch(`/`XMLHttpRequest`/`new Image`） | 正则扫描 | `src/` 全部 30 个文件 | **无匹配** |
 | 图片 / 模型 / 字体文件引用（`.png` `.jpg` `.webp` `.glb` `.gltf` `.hdr` `.woff` `.ttf` `url(` `@import` `font-face`） | 正则扫描 | `src/` 全部文件（**含 `src/assets/ref/`**，2026-10-23 复核） | **命中 7 处，全部为第 9 节登记的参考图衍生贴图**：`src/model/refTextures.ts` L26–32 静态 `import url from '../assets/ref/*.jpg'`；构建产物 `dist/assets/` 实测 7 个 `.jpg`。**除这 7 处外无任何其它匹配**（2026-10-14 的「无匹配」结论已被第 9 节的新增登记推翻，本行以现值为准） |
 | 音频文件 / `new Audio`（`.mp3` 等） | 正则扫描 | `src/` 全部 30 个文件 | **无匹配** |
-| HTML 外链（字体 / CDN / 脚本） | 通读 `index.html`；扫描 `dist/index.html` 外部 URL | 入口 + 构建产物 | **无字体 / CDN / 脚本外链**；仅第 4 节要求的许可署名链接（threejs.org / cannon-es / typescriptlang.org），不加载任何资源 |
+| HTML 外链（字体 / CDN / 脚本） | 通读 `index.html`；扫描 `dist/index.html` 外部 URL | 入口 + 构建产物 | **无字体 / CDN / 脚本外链**；仅第 4 节要求的许可署名链接（threejs.org / typescriptlang.org），不加载任何资源 |
 | 仓库内图片文件（`.png` `.jpg`） | 文件系统遍历 + `find` 全仓扫描 | 仓库全部目录（含 `.img2threejs/`） | **曾命中 12 张第三方裁片，2026-10-14 已全部删除**；现仓库内图片分两类：① `.img2threejs/renders/` + `verify/` = 本项目 QA 门禁的**自渲染截图**（**255 张**，2026-10-16 傍晚波实测，随 QA 波次增长，代码零引用）；② **`src/assets/ref/` 7 张** = 第 9 节登记的参考图衍生贴图（**会被打包进 `dist/` 并随部署页分发**，与第 7 节「仅仓库存放」不是一个量级，见第 9 节风险条） |
-| `import` 语句来源 | 全量 import 扫描 | `src/` 全部 30 个文件 | 仅本地模块 + `three` / `cannon-es` / `three/addons/*`（npm 包内文件，非外部资产） |
+| `import` 语句来源 | 全量 import 扫描 | `src/` 全部 30 个文件 | 仅本地模块 + `three` / `three/addons/*`（npm 包内文件，非外部资产） |
 
 > **运行时产物口径**：上表第 1–4 项针对 `src/` 与 `dist/` 运行时产物，结果为「零外部资产、全程序化生成」；第 5 项针对仓库工作区，历史上曾存在第三方图片（第 7 节登记），现已清空。
 
@@ -28,7 +30,6 @@
 | 名称 | 版本（实测安装） | 许可类型 | 用途 | 依据 | 引用路径 |
 |---|---|---|---|---|---|
 | three | 0.186.1 | MIT | 3D 渲染（场景 / 材质 / 后处理 EffectComposer 等 addons） | `node_modules/three/package.json` + `node_modules/three/LICENSE` | `package.json` dependencies；`src/render/**`、`src/fx/index.ts`、`src/config/theme.ts` 等 14 处 import |
-| cannon-es | 0.20.0 | MIT | 刚体物理（车辆 / 碰撞） | `node_modules/cannon-es/package.json` + `node_modules/cannon-es/LICENSE` | `package.json` dependencies；`src/physics/World.ts` |
 | @types/three | 0.186.0 | MIT | three 的 TypeScript 类型定义（仅开发期） | `node_modules/@types/three/package.json` + LICENSE | `package.json` devDependencies；不进入运行时产物 |
 | typescript | 5.9.3 | Apache-2.0 | 编译 / 类型检查（仅开发期） | `node_modules/typescript/package.json` + `LICENSE.txt` + `ThirdPartyNoticeText.txt` | `package.json` devDependencies；`npm run build` 中 `tsc --noEmit` |
 | vite | 7.3.7 | MIT | 构建 / 开发服务器（仅开发期） | `node_modules/vite/package.json` + `LICENSE.md` | `package.json` devDependencies；构建工具链 |
@@ -54,12 +55,12 @@
 
 | 资产 | 许可 | 署名要求 | 处置 |
 |---|---|---|---|
-| three / cannon-es / @types/three / vite（MIT） | MIT | **需保留版权与许可声明** | 分发包（含 dist 部署页脚或 ABOUT/README）保留四包的版权声明与 MIT 文本；本仓库已保留 `node_modules` 内 LICENSE 文件，`docs/ASSETS.md` 本节即为声明锚点；**已落地**：`index.html` 页脚 `#credits` 含 three.js / cannon-es 署名与外链，`vite build` 后随 `dist/index.html` 分发 |
+| three / @types/three / vite（MIT） | MIT | **需保留版权与许可声明** | 分发包（含 dist 部署页脚或 ABOUT/README）保留 MIT 文本；本仓库已保留 `node_modules` 内 LICENSE 文件，`docs/ASSETS.md` 本节即为声明锚点；**已落地**：`index.html` 页脚 `#credits` 含 three.js / TypeScript 署名与外链，`vite build` 后随 `dist/index.html` 分发 |
 | typescript（Apache-2.0） | Apache-2.0 | **需保留版权声明与 Apache-2.0 文本； NOTICE 要求一并保留** | 同上；`node_modules/typescript/ThirdPartyNoticeText.txt` 为现成 NOTICE 文本；**已落地**：`index.html` 页脚 `#credits` 含 TypeScript 署名与 typescriptlang.org 外链，随 `dist/index.html` 分发 |
 | 自制资产 | 本项目 | 无强制署名要求 | — |
 | three.js addons（RoundedBoxGeometry、EffectComposer 等，随 three 包分发） | MIT（随 three） | 同 three | 同 three |
 
-**要点**：MIT / Apache-2.0 均允许商用，但** redistribution 时必须保留版权与许可声明**——若将 dist 部署为公开页面并随包分发依赖代码，发布页需可访问上述声明（常见做法：页脚「Powered by three.js / cannon-es」+ 链接至本文件，或附 LICENSES 汇总文件）。
+**要点**：MIT / Apache-2.0 均允许商用，但** redistribution 时必须保留版权与许可声明**——若将 dist 部署为公开页面并随包分发依赖代码，发布页需可访问上述声明（常见做法：页脚「Powered by three.js / TypeScript」+ 链接至本文件，或附 LICENSES 汇总文件）。
 
 ## 5. 商标与品牌提示（非资产许可，单独登记）
 
@@ -138,3 +139,11 @@
 ---
 *核对方法留痕：Grep 正则扫描（`src/` 30 文件 × 多组模式）、`find` 全仓图片文件遍历、通读 `index.html` / `Sfx.ts` / `canvasTex.ts` / `Environment.ts`、`node_modules/*/package.json` license 字段读取、LICENSE 文件存在性检查。*
 *2026-10-14 变更留痕：删除第三方图片 12 张（第 7 节）；`.img2threejs/` 路径脱敏 53 处（`C:/Users/...` → `<workspace>` / `<local-reference>`）；指向已删图片的 30 处引用改写为 `已移除:<原文件名>` 标记（`assessment.json` 14、`detail-inventory.json` 14（含目录项 1）、`state.json` 1，另 `object-sculpt-spec.json` 14 由 spec-model 同格式处理）；删除 0 引用死代码 `src/render/scene/Car.ts`、`Interior.ts`（801 行）；`index.html` 新增 `#credits` 许可署名并验证进入 `dist/index.html`。*
+
+
+## 10. 外部参考资产（不交付，仅比例核对）
+
+| 资产 | 位置 | 用途 | 是否入库/打包 |
+|---|---|---|---|
+| White Castle（Fab 资产）`Scene.fbx / SM_B.fbx / SM_Det.fbx / SM_Gat.fbx` + 贴图 | `F:/Game/VaultCache/FabLibrary/White_castle-0ffccb05/`（本机 1.2GB） | 旧仓 `castleKit` 程序化构件的**比例参考**；本仓 `makeGate/makeTowerGroup/makeMainHall` 直接复用旧仓自制几何 | **否**。仓库与 `dist/` 均不含任何 FBX/PNG；运行时零外部资源 |
+| Nürburgring 赛道走向 | 公开赛道走向（人工编排 106 路点） | 中心线造型 | 否。无 GPS/OSM/DEM 数据、无第三方赛道文件 |
