@@ -1,0 +1,395 @@
+/**
+ * headLamp.ts —— V800 前大灯「竖向窄高单元」手写几何（R21-C）
+ *
+ * ┌──────────────────────────────────────────────────────────────────────────┐
+ * │ 接线说明（本文件只产部件 + 材质，不接线；接线由集成层在                      │
+ * │ V800Adapter.ts 的 R21-C 区块完成，严禁在此文件外改 Adapter / spec / 工厂） │
+ * └──────────────────────────────────────────────────────────────────────────┘
+ *
+ * 目标替换组件（spec componentTree 全量，parent 链见下）：
+ *   headlamp-l / headlamp-r   —— 竖向大灯总成 左/右，parent = front-end
+ *   其下 headlamp-led-l/r（竖向细灯条）、headlamp-star-l/r（星点平面卡）一并被
+ *   本部件取代。旧件是「竖向细灯条 + 平面卡」，与真车（顶部横置 DRL + 方形投影
+ *   透镜堆叠）不符，故整组手写替换。
+ *
+ * 对齐锚点（局部系，与工厂 headlamp-l 挤出件逐位同一坐标系，替换无需矩阵补偿）：
+ *   x ∈ [-0.075, +0.075]（宽 0.15，half 0.075）
+ *   y ∈ [-0.23,  +0.23 ]（高 0.46，half 0.23）
+ *   z ∈ [0, 0.07]        （挤出沿 0→depth，front face = z=0.07，朝 +z 即车头）
+ *   本 Group 即在此局部系原点构建；headlamp-l 自身 transform (position
+ *   [0.8,-0.074,0.081]) 由父节点 front-end → body rotY(π) 提供世界位姿，
+ *   本 Group 不需要任何额外矩阵补偿。
+ *
+ * 必须在 batchMergeStatic 之前替换（红线，与 R20 尾门同律）：
+ *   合批会把 headlamp-l/r 子树并成 batch/* 件且丢失 sculptComponent。应在合批前：
+ *   1) 找到 userData.sculptComponent.id === 'headlamp-l' / 'headlamp-r' 的 mesh（各 1 件）；
+ *   2) 该 pivot 设 visible=false（或 geometry 换空 BufferGeometry），并删去其 led/star 子节点；
+ *   3) 用同一份 createHeadLampMaterials() 产物，调用
+ *        createHeadLamp({ side:'left',  materials })
+ *        createHeadLamp({ side:'right', materials })
+ *      把返回的 group 作为子节点挂到对应 pivot（group 局部系 = 上述锚点系）。
+ *
+ * 独占材质克隆警告（红线，最重要）：
+ *   本部件自带的 6 个材质 id 全为 r21-head-lamp-*（独占、零外部图）。
+ *   绝不可把它们并入共享批次（housing-dark / lamp-head / lamp-star 等）——否则
+ *   batchMerge 按材质实例把本部件几何吞并进全车大批次，会丢光 emissive/高光且
+ *   不可单独寻址/联动。接线时把 headlamp-l/r pivot 传进 batchMergeStatic 的
+ *   excludeObjects（或 excludeIds:['headlamp-l','headlamp-r']），整棵子树退出合批。
+ *   左右共用同一材质实例（见上）→ 仅左右各 1 组 DC，无额外开销。
+ *   材质统一 side=FrontSide（R30-C1）：本部件全部为封闭实心挤出体 / 盒体，右侧镜像
+ *   已改为**几何烘焙**（见 mirrorGeometryX），不再有负尺度绕序翻转，无需 DoubleSide 兜底。
+ *
+ * 几何约定（与 project 铁律一致）：
+ *   · profile / 轮廓一律 CCW（shoelace > 0），ExtrudeGeometry 据此前向法线才会朝外；
+ *   · 挤出沿 +z（0→depth），不居中（与工厂挤出件同律，front face = z=depth）；
+ *   · 右侧镜像用 mirrorGeometryX 烘焙进几何（R30-C1：替代 group.scale.x = -1 负尺度，
+ *     世界 bbox 与旧写法逐位一致，见 .qa/r30c 探针）；
+ *   · ≤ 2.5k tri/侧（实测 ≈ 540/侧，见 .qa/r21_headlamp.mjs 输出）。
+ */
+import * as THREE from 'three';
+import { mergeSafe } from '../../util/geo';
+
+/* ================================================================
+ * 0.5 左右镜像：几何烘焙（R30-C1，替代 group.scale.x = -1）
+ * ================================================================ */
+
+/**
+ * 把几何按 x=0 平面**烘焙镜像**。为什么替代负尺度：
+ * `group.scale.x = -1` 的行列式为负 → 三角形屏幕绕序翻转，FrontSide 下外面被剔除、
+ * 法线内翻，R21 起被迫全组 DoubleSide 兜底（shadow/fragment 双倍开销）。烘焙三件套：
+ *   ① position.x 取反；
+ *   ② 三角形绕序反转 —— 索引几何只换 index 的第 2/3 项（顶点被多三角共享，绝不能
+ *      改顶点数据）；非索引几何交换每三角第 2、3 顶点的**全部属性**（保持顶点 tuples
+ *      完整，等价于换绕序）；
+ *   ③ normal.x 取反（镜像法线 = M(n)，与反转后的绕序朝向一致）。
+ * 世界位姿与旧 scale.x=-1 逐位一致（左右件 bbox 关于车体对称，探针实证）。
+ */
+function mirrorGeometryX(g: THREE.BufferGeometry): THREE.BufferGeometry {
+  const pos = g.getAttribute('position') as THREE.BufferAttribute;
+  const nrm = g.getAttribute('normal') as THREE.BufferAttribute | undefined;
+  for (let i = 0; i < pos.count; i += 1) {
+    pos.setX(i, -pos.getX(i));
+    if (nrm) nrm.setX(i, -nrm.getX(i));
+  }
+  pos.needsUpdate = true;
+  if (nrm) nrm.needsUpdate = true;
+  const index = g.getIndex();
+  if (index) {
+    const arr = index.array;
+    for (let i = 0; i < arr.length; i += 3) {
+      const t = arr[i + 1];
+      arr[i + 1] = arr[i + 2];
+      arr[i + 2] = t;
+    }
+    index.needsUpdate = true;
+  } else {
+    for (let i = 0; i < pos.count; i += 3) {
+      for (const name of Object.keys(g.attributes)) {
+        const attr = g.attributes[name] as THREE.BufferAttribute;
+        const n = attr.itemSize;
+        const a = attr.array as Float32Array;
+        for (let k = 0; k < n; k += 1) {
+          const i1 = (i + 1) * n + k;
+          const i2 = (i + 2) * n + k;
+          const t = a[i1];
+          a[i1] = a[i2];
+          a[i2] = t;
+        }
+      }
+    }
+  }
+  g.computeBoundingBox();
+  g.computeBoundingSphere();
+  return g;
+}
+
+/* ================================================================
+ * 0. 局部系常量（与工厂 headlamp-l 挤出件逐位一致）
+ * ================================================================ */
+
+/** 单元半宽（spec dimensions.width 0.15 → half 0.075） */
+export const HALF_W = 0.075;
+/** 单元半高（spec dimensions.height 0.46 → half 0.23） */
+export const HALF_H = 0.23;
+/** 挤出深度 = 单元总厚（spec dimensions.depth 0.07）；front face 落在 z = DEPTH */
+export const DEPTH = 0.07;
+/** front face 的世界-局部 z（= DEPTH），所有发光/透镜件贴此面前方 */
+export const FRONT_Z = DEPTH;
+
+/* ================================================================
+ * 1. 对外类型
+ * ================================================================ */
+
+export interface HeadLampMaterials {
+  /** 深色底座（housing-dark 质感，独占） */
+  housing: THREE.MeshStandardMaterial;
+  /** 顶部横向 DRL 白光刃（emissive，独占） */
+  drl: THREE.MeshStandardMaterial;
+  /** 方形投影透镜 chrome 边圈（独占） */
+  lensFrame: THREE.MeshStandardMaterial;
+  /** 透镜深色玻璃芯（高光，独占） */
+  lensGlass: THREE.MeshStandardMaterial;
+  /** 透镜中心微凸点亮态（emissive，独占） */
+  lensCore: THREE.MeshStandardMaterial;
+  /** 顶部星点装饰（emissive，独占） */
+  star: THREE.MeshStandardMaterial;
+}
+
+export interface HeadLampOptions {
+  /** 左右镜像：'right' 用 mirrorGeometryX 烘焙进几何（R30-C1，替代 scale.x=-1 负尺度） */
+  side?: 'left' | 'right';
+  /** 复用外部材质实例（接线时必须左右共用同一份，否则合批无法左右并 DC） */
+  materials?: HeadLampMaterials;
+}
+
+export interface HeadLampResult {
+  /** 在 headlamp 局部系原点构建的 Group（右侧已含烘焙镜像，无负尺度） */
+  group: THREE.Group;
+  /** 本部件用到的 6 个独占材质 */
+  materials: HeadLampMaterials;
+  /** 本侧三角形总数（索引/非索引统一折算） */
+  triangleCount: number;
+}
+
+/* ================================================================
+ * 2. 形状 / 挤出辅助（全部 CCW）
+ * ================================================================ */
+
+/** 圆角矩形轮廓（CCW，中心在原点）。_seg 预留：圆角弧段数（当前走 THREE.Shape.absarc 默认细分）。 */
+function roundedRectShape(w: number, h: number, r: number, _seg = 6): THREE.Shape {
+  const hw = w / 2;
+  const hh = h / 2;
+  const s = new THREE.Shape();
+  s.moveTo(-hw + r, -hh);
+  s.lineTo(hw - r, -hh);
+  s.absarc(hw - r, -hh + r, r, -Math.PI / 2, 0, false);
+  s.lineTo(hw, hh - r);
+  s.absarc(hw - r, hh - r, r, 0, Math.PI / 2, false);
+  s.lineTo(-hw + r, hh);
+  s.absarc(-hw + r, hh - r, r, Math.PI / 2, Math.PI, false);
+  s.lineTo(-hw, -hh + r);
+  s.absarc(-hw + r, -hh + r, r, Math.PI, Math.PI * 1.5, false);
+  return s;
+}
+
+/**
+ * 圆角矩形「框」（外轮廓 + 反向绕序的内孔），用于透镜 chrome 边圈。
+ * 内孔用顺时针（true）以保证与外侧 CCW 相反，ExtrudeGeometry 才能正确掏洞。
+ */
+function roundedRectFrameShape(
+  w: number, h: number, r: number,
+  iw: number, ih: number, ir: number,
+  seg = 6
+): THREE.Shape {
+  const outer = roundedRectShape(w, h, r, seg);
+  const hole = new THREE.Path();
+  const hw = iw / 2;
+  const hh = ih / 2;
+  hole.moveTo(-hw + ir, -hh);
+  hole.lineTo(hw - ir, -hh);
+  hole.absarc(hw - ir, -hh + ir, ir, -Math.PI / 2, 0, true);
+  hole.lineTo(hw, hh - ir);
+  hole.absarc(hw - ir, hh - ir, ir, 0, Math.PI / 2, true);
+  hole.lineTo(-hw + ir, hh);
+  hole.absarc(-hw + ir, hh - ir, ir, Math.PI / 2, Math.PI, true);
+  hole.lineTo(-hw, -hh + ir);
+  hole.absarc(-hw + ir, -hh + ir, ir, Math.PI, Math.PI * 1.5, true);
+  outer.holes.push(hole);
+  return outer;
+}
+
+/** 挤出 0→depth（front cap 在 z=depth），带小圆角倒边；返回非索引几何并刷 bbox。 */
+function extrude(shape: THREE.Shape, depth: number, bevel = 0.003): THREE.BufferGeometry {
+  const g = new THREE.ExtrudeGeometry(shape, {
+    depth,
+    bevelEnabled: bevel > 0,
+    bevelThickness: bevel,
+    bevelSize: bevel,
+    bevelSegments: 1,
+    steps: 1,
+    curveSegments: 6
+  });
+  g.computeBoundingBox();
+  return g;
+}
+
+/** 把几何平移到目标位置（合并同材质件前，先烘焙好各自的世界-局部偏移）。 */
+function at(g: THREE.BufferGeometry, x: number, y: number, z: number): THREE.BufferGeometry {
+  g.translate(x, y, z);
+  g.computeBoundingBox();
+  return g;
+}
+
+/* ================================================================
+ * R65 · 弧形 DRL 灯带（用户：前灯应弧形贴图）
+ * ================================================================
+ * 平直 DRL 条 → 沿抛物线的弧形灯带。灯带沿 X 展开（宽 DRL_ARC.w），中线在两端
+ * 落 ARC_Y0、居中上拱 ARC_BOW（抛物线 y = ARC_Y0 + ARC_BOW·(1-(2x/w)²)），
+ * 上下各偏 ARC_T/2 围成闭合 profile，再 extrude(DRL_ARC.depth)。纯几何、零贴图、
+ * 同 drl 材质 ⇒ DC/材质实例不变。`#r65drlarc=off` 回平直条（A/B 对照）。
+ */
+const DRL_ARC = {
+  w: 0.125,     // 灯带展开宽（同原平直条）
+  y0: 0.168,    // 两端中线 y
+  bow: 0.022,   // 居中上拱量（弧顶 y = y0+bow ≈ 0.19 < 罩顶 0.2，不穿顶）
+  t: 0.018,     // 灯带厚（上下各 t/2）
+  depth: 0.008  // 挤出厚（同原条）
+} as const;
+
+/** R65：弧形 DRL 灯带**默认关闭**（回 R64 平直条）。实测（真机 3/4 视图）弧形带位于
+ *  灯罩顶部(y≈0.17–0.19，罩顶 0.23)，3/4 视角读作"悬浮机盖上方的白刃"、且灯透镜内
+ *  无光签名(暗块) ⇒ 观感倒退。弧形须做进透镜玻璃内的光签名贴图(非顶部几何条)才对，
+ *  本环境无法可靠目检校准 ⇒ 默认回平直条，实验保留给 `#r65drlarc=on` 显式启用。 */
+const R65_DRL_ARC_ON: boolean =
+  typeof window !== 'undefined' && /(?:^|[#&])r65drlarc=on/i.test(window.location.hash);
+
+/** 弧形灯带 profile：外弧(x,-t/2→+t/2 上拱) + 内弧回程，闭合 CCW。 */
+function arcBandShape(a: typeof DRL_ARC): THREE.BufferGeometry {
+  const shape = new THREE.Shape();
+  const N = 16;
+  const halfW = a.w / 2;
+  const cy = (x: number): number => a.y0 + a.bow * (1 - Math.pow(2 * x / a.w, 2));
+  // 外弧（上缘）左→右
+  for (let i = 0; i <= N; i += 1) {
+    const x = -halfW + (i / N) * a.w;
+    const y = cy(x) + a.t / 2;
+    if (i === 0) shape.moveTo(x, y); else shape.lineTo(x, y);
+  }
+  // 内弧（下缘）右→左
+  for (let i = N; i >= 0; i -= 1) {
+    const x = -halfW + (i / N) * a.w;
+    shape.lineTo(x, cy(x) - a.t / 2);
+  }
+  shape.closePath();
+  const g = extrude(shape, a.depth, 0.001);
+  g.computeBoundingBox();
+  return g;
+}
+
+/* ================================================================
+ * 3. 独占材质工厂（零外部图片；id 全 r21-head-lamp-*）
+ * ================================================================ */
+
+export function createHeadLampMaterials(): HeadLampMaterials {
+  const mk = (id: string, params: THREE.MeshStandardMaterialParameters): THREE.MeshStandardMaterial => {
+    // R30-C1：全部件均为封闭实心挤出体/盒体 → FrontSide（镜像已烘焙进几何，无绕序翻转）
+    const m = new THREE.MeshStandardMaterial({ side: THREE.FrontSide, ...params });
+    m.userData.sculptMaterial = { id };
+    return m;
+  };
+  return {
+    housing: mk('r21-head-lamp-housing', {
+      color: 0x14171c, metalness: 0.42, roughness: 0.55
+    }),
+    drl: mk('r21-head-lamp-drl', {
+      color: 0xffffff, emissive: 0xeaf2ff, emissiveIntensity: 1.4, metalness: 0.0, roughness: 0.3
+    }),
+    lensFrame: mk('r21-head-lamp-lens-frame', {
+      color: 0xc9ccd2, metalness: 1.0, roughness: 0.18
+    }),
+    lensGlass: mk('r21-head-lamp-lens-glass', {
+      color: 0x0a0c10, metalness: 0.25, roughness: 0.08
+    }),
+    lensCore: mk('r21-head-lamp-lens-core', {
+      color: 0x222a33, emissive: 0xbfe0ff, emissiveIntensity: 1.2, metalness: 0.0, roughness: 0.25
+    }),
+    star: mk('r21-head-lamp-star', {
+      color: 0xffffff, emissive: 0xfff2cc, emissiveIntensity: 0.9, metalness: 0.3, roughness: 0.3
+    })
+  };
+}
+
+/* ================================================================
+ * 4. 主构造
+ * ================================================================ */
+
+export function createHeadLamp(options: HeadLampOptions = {}): HeadLampResult {
+  const side = options.side ?? 'left';
+  const materials = options.materials ?? createHeadLampMaterials();
+
+  // ---- 4.1 深色底座（含底部装饰条，同材质合并）----
+  const housingParts: THREE.BufferGeometry[] = [];
+  // 外壳：比 spec 轮廓略内收 2mm，留 1 道 3mm 倒边，front face 落在 z = DEPTH
+  housingParts.push(
+    extrude(roundedRectShape(2 * (HALF_W - 0.002), 2 * (HALF_H - 0.006), 0.028, 4), DEPTH, 0)
+  );
+  // 底部小装饰条（深色，嵌在 front face 前方 0.5mm，读成「底部装饰区」）
+  housingParts.push(
+    at(extrude(roundedRectShape(0.10, 0.020, 0.006, 3), 0.006, 0), 0, -0.205, FRONT_Z - 0.002)
+  );
+  const housingGeo = mergeSafe(housingParts);
+
+  // ---- 4.2 顶部 DRL 白光刃 —— R65 弧形灯带**默认关**(回平直条)，见 DRL_ARC/R65_DRL_ARC_ON 注 ──
+  // 原：平直横条 roundedRectShape(0.125,0.020) @y0.178。弧形带默认关原因见 R65_DRL_ARC_ON。
+  const drlGeo = R65_DRL_ARC_ON ? arcBandShape(DRL_ARC) : at(
+    extrude(roundedRectShape(0.125, 0.020, 0.006, 3), 0.008, 0),
+    0, 0.178, FRONT_Z - 0.004
+  );
+  if (R65_DRL_ARC_ON) drlGeo.translate(0, 0, FRONT_Z - 0.004);
+
+  // ---- 4.3 4 颗方形投影透镜（chrome 边圈 + 深色玻璃芯 + 中心微凸亮点）----
+  const yCenters = [0.105, 0.02, -0.065, -0.15];
+  const frameParts: THREE.BufferGeometry[] = [];
+  const glassParts: THREE.BufferGeometry[] = [];
+  const coreParts: THREE.BufferGeometry[] = [];
+  for (const yc of yCenters) {
+    // chrome 边圈：外 0.095 / 内 0.074，边框厚 1.8mm，front 凸出 face 1.4mm
+    frameParts.push(
+      at(
+        extrude(roundedRectFrameShape(0.095, 0.095, 0.012, 0.074, 0.074, 0.009, 2), 0.018, 0),
+        0, yc, FRONT_Z - 0.004
+      )
+    );
+    // 玻璃芯：0.074 见方，内凹 4mm（front 在 face+1mm，比边圈 front 低 4mm → 陷进罩内）
+    glassParts.push(
+      at(new THREE.BoxGeometry(0.074, 0.074, 0.014), 0, yc, FRONT_Z - 0.004)
+    );
+    // 中心亮点：0.022 见方，凸出 4mm 过边圈 front（ bulge 点亮态）
+    coreParts.push(
+      at(new THREE.BoxGeometry(0.022, 0.022, 0.020), 0, yc, FRONT_Z + 0.012)
+    );
+  }
+  const frameGeo = mergeSafe(frameParts);
+  const glassGeo = mergeSafe(glassParts);
+  const coreGeo = mergeSafe(coreParts);
+
+  // ---- 4.4 顶部星点装饰（替代旧 headlamp-star 平面卡；零图，emissive 微光）----
+  const starGeo = at(new THREE.BoxGeometry(0.024, 0.024, 0.006), 0, 0.2, FRONT_Z - 0.004);
+
+  // ---- 4.5 装配：每材质 1 个 mesh，挂到 Group ----
+  const group = new THREE.Group();
+  group.name = side === 'right' ? 'headlamp-r-hand' : 'headlamp-l-hand';
+  group.userData.sculptComponent = { id: side === 'right' ? 'headlamp-r' : 'headlamp-l' };
+
+  const addMesh = (geo: THREE.BufferGeometry, mat: THREE.Material, name: string): void => {
+    const mesh = new THREE.Mesh(geo, mat);
+    mesh.name = name;
+    group.add(mesh);
+  };
+  addMesh(housingGeo, materials.housing, 'hl-housing');
+  addMesh(drlGeo, materials.drl, 'hl-drl');
+  addMesh(frameGeo, materials.lensFrame, 'hl-lens-frame');
+  addMesh(glassGeo, materials.lensGlass, 'hl-lens-glass');
+  addMesh(coreGeo, materials.lensCore, 'hl-lens-core');
+  addMesh(starGeo, materials.star, 'hl-star');
+
+  // ---- 4.6 左右镜像：烘焙进几何（R30-C1，替代 group.scale.x = -1）----
+  if (side === 'right') {
+    group.traverse((o) => {
+      const m = o as THREE.Mesh;
+      if (m.isMesh) mirrorGeometryX(m.geometry);
+    });
+  }
+
+  // ---- 4.7 统计 tri 数 ----
+  let triangleCount = 0;
+  group.traverse((o) => {
+    const m = o as THREE.Mesh;
+    if (!m.isMesh) return;
+    const g = m.geometry;
+    triangleCount += g.index ? g.index.count / 3 : g.getAttribute('position').count / 3;
+  });
+  group.updateMatrixWorld(true);
+
+  return { group, materials, triangleCount };
+}

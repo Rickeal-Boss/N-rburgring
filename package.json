@@ -1,0 +1,22 @@
+{
+  "name": "nrburgring",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "description": "纽博格林北环 · 自由驾驶巡游 —— Vite + TypeScript + three.js 程序化三维赛道",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc --noEmit && vite build",
+    "preview": "vite preview",
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "three": "0.186.1"
+  },
+  "devDependencies": {
+    "@types/three": "^0.186.0",
+    "typescript": "~5.9.2",
+    "vite": "^7.1.0",
+    "vitest": "^3.2.7"
+  }
+}

@@ -1,0 +1,44 @@
+node_modules/
+dist/
+*.local
+.DS_Store
+Thumbs.db
+npm-debug.log*
+
+# 临时构建与浏览器 profile（Edge CDP 产物，体积大且不可复现）
+.img2threejs/tmpbuild/
+*.binarypb
+*.db-journal
+*.db-wal
+
+# QA probe workspace (browser profile / screenshots / temp bundles)
+.qa/
+
+# spec 迭代备份（本地产物，不入库；正式证据走 verify/）
+.img2threejs/*.bak-*
+*.bak-r*
+
+# Edge CDP 浏览器 profile 与临时渲染产物
+.img2threejs/renders/.edge-*/
+
+# Windows 保留名目录（由 `2>nul` 重定向误建，系统级无法删除）
+nul/
+
+# R29：esbuild 打出的探针 bundle（779KB，可由 .mjs 构建脚本再生，不入库）
+tools/r29_probe_bundle.mjs
+
+# 凭据与密钥防呆（隐私整改 P2：阻断 .env / 私钥 / npmrc 等误入库）
+.env
+.env.*
+*.pem
+*.key
+*.p12
+*.pfx
+id_rsa*
+id_ed25519*
+*.npmrc
+.netrc
+
+# N-rburgring
+.qa/
+*.log

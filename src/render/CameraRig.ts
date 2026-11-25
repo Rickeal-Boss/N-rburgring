@@ -1,0 +1,656 @@
+/**
+ * 多视角相机 rig（P3 扩展为六模式，注册表驱动）：
+ * - chase  追随（动态 FOV 55→68 随速度 + 震屏）
+ * - hood   机盖前视（前挡下沿上方，向前看）
+ * - cabin  车内驾驶员视角（左舵目高 ~1.15m，near 降到 0.05 防内饰裁剪）
+ * - orbit  环绕（菜单/结算）
+ * - side   电影侧机位（车侧平行跟拍；STOPPED/CRASHED 结算段由 Game 自动切入）
+ * - crash  翻滚远景（撞车慢动作段）
+ * hood/cabin/side 使用车体局部偏移（local=true，随车体朝向旋转）；
+ * 切换通过指数阻尼做 0.4~0.6s 的位置/朝向插值，不瞬跳。
+ */
+import * as THREE from 'three';
+import type { InteriorViews } from '../config/vehicles';
+import { clamp } from '../util/math';
+
+export type CameraMode =
+  | 'orbit'
+  | 'chase'
+  | 'hood'
+  | 'cabin'
+  | 'cabinDriver'
+  | 'cabinPassenger'
+  | 'cabinRear'
+  | 'side'
+  /** R29 自由探索专用：**车体局部**跟随第三人称（在车后 9.5m / 高 3.4m）。
+   *  为什么不复用 chase：chase 是 `local:false`（世界系偏移），车头一转向相机就
+   *  留在世界 +Z 侧 =「车横着开镜头不跟」；side 虽是 local 但只在车侧 4.6m，
+   *  自由驾驶时整屏都是车身（verify/r29_free/c_free_driving.png 实证）。
+   *  本机位把 local 跟随与第三人称距离合到一起，专供自由探索。 */
+  | 'free'
+  | 'crash';
+
+/** V 键在 ACCEL/BRAKE 段可循环的视角（orbit 仅供菜单/结算） */
+export const CYCLE_VIEWS: readonly CameraMode[] = ['chase', 'hood', 'cabin', 'side'];
+
+/** 车内机位集合（前挡遮挡件要在这些模式下隐藏；自由视角走「转头」而非「环绕」） */
+const INTERIOR_MODES: ReadonlySet<CameraMode> = new Set<CameraMode>([
+  'cabin',
+  'cabinDriver',
+  'cabinPassenger',
+  'cabinRear'
+]);
+
+/** 是否车内机位（前挡从内部看是一块灰板，需隐藏；拖拽=转头而非环绕） */
+export function isInteriorMode(mode: CameraMode): boolean {
+  return INTERIOR_MODES.has(mode);
+}
+
+/** 按车型生成 V 键循环表：V800 5 档（含 orbit）；R7 7 档（三内饰机位） */
+export function cycleViewsFor(hasInteriorViews: boolean): readonly CameraMode[] {
+  return hasInteriorViews
+    ? ['chase', 'hood', 'cabinDriver', 'cabinPassenger', 'cabinRear', 'orbit', 'side']
+    : ['chase', 'hood', 'cabin', 'orbit', 'side'];
+}
+
+interface ModePose {
+  offset: THREE.Vector3;
+  look: THREE.Vector3;
+  fov: number;
+  /** 偏移追踪刚度（仅用于机位切换的位姿过渡） */
+  k: number;
+  near: number;
+  /** true = 偏移在车体局部坐标系（随车头朝向旋转） */
+  local: boolean;
+}
+
+/**
+ * 机位姿态表。P4 性能：写入共享 POSE 对象而非每帧 new（每帧省 2 个 Vector3 + 1 个对象字面量）。
+ * 同一时刻只有一种机位生效，共享写入安全。
+ */
+const POSE: ModePose = {
+  offset: new THREE.Vector3(),
+  look: new THREE.Vector3(),
+  fov: 55,
+  k: 2,
+  near: 0.1,
+  local: false
+};
+
+/**
+ * 内置车内机位（未注入 interiorViews 时的统一回退 = 原 cabin 偏移）
+ *
+ * R15 实证：原眼点 (−0.55, 1.33, −0.58) 落在**第一排靠背前方 12cm**——
+ * leather-warm 合批（含菱格座椅）世界 z 从 −0.456 起，眼点 −0.58 正好贴着靠背，
+ * 车里看到的那块「中央隔板实体模块」就是它（挂上参考图后被读成一面绗缝大墙）。
+ * 眼点前移 27cm 到 −0.85 越过靠背，并略降 5cm，正前方视野才落到仪表台+路面上。
+ *
+ * R27（用户反馈「V800 车内视角需要抬高一些」）：y 1.20 → 1.34。坐姿眼点应高于
+ * 腰带线（greenhouse-glass 下沿 1.095）约 0.25m（实车约 0.25~0.30m），原 1.20 只高出
+ * 0.10m，仪表台/方向盘占比过大、前方路面被 cowl 吃掉；抬到 1.34 后视线越过 cowl
+ * （z1.63, y1.108）的余量从 9cm 增到 19cm，路面视野显著扩大（三机位截图复核）。
+ */
+const CABIN_EYE: readonly [number, number, number] = [-0.40, 1.34, -0.72];
+const CABIN_TARGET: readonly [number, number, number] = [-0.30, 0.98, -9];
+
+/* ── R71 · cabin 近平面根治方向盘黑帧（渲染层，与 R7/V800Adapter 的距离门控同补位）──────
+ * 根因：52k-tri 高精盘挂 body 下随俯仰/侧倾，cabin 相机只随偏航、near=0.05 ⇒ 盘面逼近/
+ *   扫过近平面时 near 区深度精度极差（far/near = 12000/0.05 = 24 万），盘自身三角深度冲突
+ *   ⇒ 整帧高频闪烁（黑帧）。增大 near 收紧 near 区、大幅提升近区深度精度。
+ * 取值：主驾眼点到盘心 ≈0.55m，near 0.1 远小于该距离，不裁盘/不裁内饰近景（R17b 眼点余量
+ *   仍满足）；相比 0.05 把近区深度精度提约 2 倍。
+ * 回滚钩子：`#r71steerrender=off` ⇒ 回 near=0.05（模块顶层求值一次，每帧只读常数）。 */
+/** `#r71steerrender=off` ⇒ 回退 near=0.05（旧行为）；默认 ON ⇒ near=0.1 */
+const R71_STEER_RENDER: boolean =
+  typeof window === 'undefined' || !/(?:^|[#&])r71steerrender=off/i.test(window.location.hash);
+/** cabin 系机位（cabin / cabinDriver/Passenger/Rear）的近平面：R71 由 0.05 提到 0.1 */
+const CABIN_NEAR: number = R71_STEER_RENDER ? 0.1 : 0.05;
+
+/**
+ * QA 机位标定钩子：`#eye=x,y,z,tx,ty,tz` 覆盖内建 cabin 机位（世界坐标）。
+ * 用途：车内视角「被某块面挡住」时，沿纵深逐点扫描找可行的眼点，
+ * 比反复改源码再重启快一个数量级。仅在 hash 显式给出时生效。
+ */
+const CABIN_EYE_OVERRIDE: readonly [number, number, number] | null = (() => {
+  if (typeof window === 'undefined') return null;
+  const m = /[#&]eye=(-?[\d.]+),(-?[\d.]+),(-?[\d.]+)(?:,(-?[\d.]+),(-?[\d.]+),(-?[\d.]+))?/.exec(
+    window.location.hash
+  );
+  if (!m) return null;
+  return [Number(m[1]), Number(m[2]), Number(m[3])];
+})();
+const CABIN_TARGET_OVERRIDE: readonly [number, number, number] | null = (() => {
+  if (typeof window === 'undefined') return null;
+  const m = /[#&]eye=(-?[\d.]+),(-?[\d.]+),(-?[\d.]+)(?:,(-?[\d.]+),(-?[\d.]+),(-?[\d.]+))?/.exec(
+    window.location.hash
+  );
+  if (!m || m[4] === undefined) return null;
+  return [Number(m[4]), Number(m[5]), Number(m[6])];
+})();
+
+/**
+ * R65 · 机盖机位（hood）标定。
+ *
+ * R65-G8 回退定案（用户 11-10 真机截图）：R65-F/G 把机位改到 z+1.4/z+2.0（误判 local z
+ * 符号/朝向）⇒ 相机**落进座舱**（真机截图拍到座椅+顶棚，非机盖）。回退到**最初**
+ * offset(0,1.45,-1.45)→look(0,0.95,-16)：该值真机确认机盖正确入画。用户「机盖退太后」
+ * 是相对官图视角的微调诉求，非错位 ⇒ 先恢复正确机盖态，微调留 `#hoodcam=` 扫参。
+ *
+ * `#hoodcam=y,z,ly` 供真机 A/B 扫参；`#hoodcam=off` 逐位回 R65-F 机位 (0,1.55,1.4)→look(0,0.9,-16)。
+ */
+const HOOD_POSE_OVERRIDE: { y: number; z: number; lookY: number } | null = (() => {
+  if (typeof window === 'undefined') return null;
+  if (/(?:^|[#&])hoodcam=off/i.test(window.location.hash)) return { y: 1.55, z: 1.4, lookY: 0.9 };
+  const m = /[#&]hoodcam=(-?[\d.]+),(-?[\d.]+)(?:,(-?[\d.]+))?/.exec(window.location.hash);
+  if (!m) return null;
+  return { y: Number(m[1]), z: Number(m[2]), lookY: m[3] !== undefined ? Number(m[3]) : 0.95 };
+})();
+/* ── R81 · 撤销 R80 机盖回退，恢复 R65-G8 用户真机确认基线 −1.45 ──────────────
+ * R80 曾把 HOOD_Z 由 −1.45 改 −1.30（`#r80hood=off` 回 −1.45）；用户 11-13 真机
+ * 读作「机盖后移 / 机盖不入画」。R65-G8 的 (0,1.45,−1.45)→look(0,0.95,−16) 是
+ * **用户真机确认机盖正确入画**的唯一基线，优先于外部审查组的几何探针结论
+ * （该组按 greenhouse-glass Z=4.43m 推断 −1.45/−1.30/−2.45 全在玻璃舱内，建议
+ *  `#hoodcam=1.2,-2.9,0.8`；该结论与真机基线矛盾，审查人亦建议重截屏核对）。
+ * ⇒ R81 默认恢复 −1.45；−1.30 改由显式开关 `#r81hood=on` 才启用；`#r80hood=off`
+ *   仍强制回 −1.45（「回退基线」语义保留，现与默认一致）；几何探针分歧留
+ *   `#hoodcam=y,z,ly` 扫参钩子原样保留供真机定案，`#hoodcam=off` 语义不变。
+ * 回滚：`#r81hood=on` ⇒ R80 的 −1.30；不带任何钩子 ⇒ R65-G8 的 −1.45。
+ * ⚠ 常量名 R80_HOOD_BACK 保留（护栏三元正则按符号引用），语义反转为默认 false。 */
+const R80_HOOD_BACK: boolean =
+  typeof window !== 'undefined' &&
+  /(?:^|[#&])r81hood=on/i.test(window.location.hash) &&
+  !/(?:^|[#&])r80hood=off/i.test(window.location.hash);
+const HOOD_Y = HOOD_POSE_OVERRIDE?.y ?? 1.45;
+const HOOD_Z = HOOD_POSE_OVERRIDE?.z ?? (R80_HOOD_BACK ? -1.30 : -1.45);
+const HOOD_LOOK_Y = HOOD_POSE_OVERRIDE?.lookY ?? 0.95;
+/**
+ * R71 · 照片模式自由飞行回滚钩子：`#r71freefly=off` 逐位回 R70 绕车轨道。
+ * off 时 beginFly() 直接 no-op（flyActive 恒 false），update() 不走飞行早退分支，
+ * 照片平移退回 panOffset 叠加链路 —— 全部原轨道代码保留不删，便于 A/B 与回滚。
+ */
+const FREE_FLY_DISABLED = (() => {
+  if (typeof window === 'undefined') return false;
+  return /(?:^|[#&])r71freefly=off/i.test(window.location.hash);
+})();
+
+/**
+ * R97 · 自由探索机位动态 FOV（速度感）。纽北改造后 Game 已不再使用 free 机位，
+ * 但 `cycleViewsFor`/MODES 表里的 free 分支保留（回滚通道），FOV 函数一并保留。
+ */
+export function freeFovForSpeed(speed: number): number {
+  return 60 + Math.min(speed / 55, 1) * 12;
+}
+
+const MODES: Record<CameraMode, (speed: number, portrait: boolean, time: number) => void> = {
+  orbit: (_speed, portrait, time) => {
+    // 相位 3π/4：t=0 机位落在右前 45°（游戏里车头朝 -Z，无相位时 t=0 正对车尾，
+    // 菜单首印象是屁股——2026-10-17 第四轮审查 S5④）
+    const phase = Math.PI * 0.75;
+    const radius = portrait ? 9.5 : 7.8;
+    POSE.offset.set(Math.sin(time * 0.16 + phase) * radius, portrait ? 2.4 : 1.5, Math.cos(time * 0.16 + phase) * radius);
+    POSE.look.set(0, portrait ? -1.6 : 0.85, 0);
+    POSE.fov = portrait ? 58 : 42;
+    POSE.k = 2;
+    POSE.near = 0.1;
+    POSE.local = false;
+  },
+  chase: (speed) => {
+    // 动态 FOV：55 → 68 随速度
+    const e = Math.min(speed / 72, 1);
+    // 车距 = 基准 8.2 − 1.4e + 显式速度回拉 speed/5。
+    // 最后这项是把旧 anchor 阻尼（anchorK=5）的**稳态**滞后 v/5 显式搬到姿态里：
+    // 构图与 R13 完全一致（55 m/s 时相机在车后 17.9 m），但它现在是确定性的
+    // 速度函数，不再由 dt 逐帧积分 —— 既不抖，也不会把 dt 尖刺写进相对位移。
+    POSE.offset.set(1.6 - e * 1.2, 2.2 - e * 0.5, 8.2 - e * 1.4 + speed / 5);
+    POSE.look.set(0, 1, -6);
+    POSE.fov = 55 + e * 13;
+    POSE.k = 2.5;
+    POSE.near = 0.1;
+    // 纽北改造：chase 改**车体局部**（以前是世界系偏移，车头一转向相机就留在世界 +Z 侧
+    // = 「车横着开镜头不跟」）。构图数值一个不动，只换坐标系。
+    POSE.local = true;
+  },
+  hood: () => {
+    // 引擎盖正上方（R65：前移到机盖中段、抬过车顶 ~1.6 ⇒ 车顶内壁几何上落到相机背后，
+    // V800 headliner-suede / R7 suede-ivory 顶棚不再悬挂入画；机盖面在画面下半铺开）。
+    // `#hoodcam=y,z,ly` 扫参 / `#hoodcam=off` 回旧机位 (0,1.45,-1.45)→look(0,0.95,-16)。
+    // R81 二轮 · 图1（image#16「机盖」下半纯黑）诊断留痕：`hood` ∉ INTERIOR_MODES
+    //   ⇒ applyVisibility 收 interior=false ⇒ bodyMesh FrontSide / visible=true、
+    //   applyRoofCull(false) 恢复 full index、cabin 专属件（isPoke/isBlock）全隐
+    //   ⇒ 下半纯黑**不是** cabin 态 DoubleSide 内壁。R80 的 HOOD_Z=−1.30 是该视角
+    //   唯一变化量，R81 已恢复用户真机基线 −1.45；若仍黑，`#r81hood=on` 逐位回
+    //   R80 机位做 A/B，`#hoodcam=y,z,ly` 扫参供真机定案（不臆断黑面归属）。
+    // R84 · R7 独立机盖机位：两车共用绝对 HOOD_Z=−1.45 时，R7 车头比 V800 短 0.47m
+    //   ⇒ 相机相对贴前 0.47m，用户读作「机盖后移 / 不入画」。按「相机距车头等距」补偿：
+    //   R7_HOOD_Z = −(R7_front − HOOD_FRONT_SETBACK) = −(2.52 − 1.12) = −1.40。
+    //   `#r84r7hood=off` ⇒ 回共用 HOOD_Z=−1.45（R84 之前基线）。
+    POSE.offset.set(0, HOOD_Y, HOOD_Z);
+    POSE.look.set(0, HOOD_LOOK_Y, -16);
+    POSE.fov = 66;
+    POSE.k = 4;
+    POSE.near = 0.1;
+    POSE.local = true;
+  },
+  cabin: () => {
+    // 驾驶位头枕前方，目高 1.20m（R17b：原 1.32 高于方向盘顶 1.173 → 只见轮缘弧
+    // 不见盘辐/轮毂 =「香蕉弧」；降到 1.20 与方向盘顶 1.225 齐平后盘面正对眼点，
+    // 盘辐/轮毂/仪表全部入画。R15b 的座椅靠背外移约束（minDist 0.15m）仍满足。
+    POSE.offset.set(...(CABIN_EYE_OVERRIDE ?? CABIN_EYE));
+    POSE.look.set(...(CABIN_TARGET_OVERRIDE ?? CABIN_TARGET));
+    POSE.fov = 68;
+    POSE.k = 4;
+    POSE.near = CABIN_NEAR;
+    POSE.local = true;
+  },
+  cabinDriver: () => setInteriorPose('driver'),
+  cabinPassenger: () => setInteriorPose('passenger'),
+  cabinRear: () => setInteriorPose('rear'),
+  free: (speed) => {
+    // 自由探索：车后 9.5m / 高 3.4m 的局部跟随（转向时整体绕车旋转）
+    // R97：补回自由机位速度感 —— Game.ts 已传 absSpeed，此前 free 写成 () 未消费该参数，
+    // FOV 恒定 60 ⇒ 自由探索零速度感。现按 freeFovForSpeed 随速度 60→72；构图量全部不动。
+    POSE.offset.set(0, 3.4, 9.5);
+    POSE.look.set(0, 1.3, -9);
+    POSE.fov = freeFovForSpeed(speed);
+    POSE.k = 3;
+    POSE.near = 0.1;
+    POSE.local = true;
+  },
+  side: () => {
+    // 车侧平行跟拍机位
+    POSE.offset.set(4.6, 1.5, 0.6);
+    POSE.look.set(0, 0.85, -0.6);
+    POSE.fov = 45;
+    POSE.k = 3;
+    POSE.near = 0.1;
+    POSE.local = true;
+  },
+  crash: () => {
+    POSE.offset.set(9, 4.5, 13);
+    POSE.look.set(0, 0, 0);
+    POSE.fov = 55;
+    POSE.k = 2.2;
+    POSE.near = 0.1;
+    POSE.local = false;
+  }
+};
+
+const IDENT = new THREE.Quaternion();
+const UP = new THREE.Vector3(0, 1, 0);
+
+/**
+ * 装配注入的内饰三机位（模块级单例：进程内只有一个 rig，见 Game）。
+ * 未注入时各槽位回退到内置 cabin 偏移（CABIN_EYE/CABIN_TARGET）。
+ */
+let INTERIOR_VIEWS: InteriorViews | null = null;
+
+function setInteriorPose(slot: keyof InteriorViews): void {
+  // R17b：#eye 覆盖对 R7 三内饰机位同样生效（headless QA 免重建标定钩子，
+  // 仅 hash 显式给出时存在，正常游玩永远走下面两条正常路径）
+  if (CABIN_EYE_OVERRIDE) {
+    POSE.offset.set(...CABIN_EYE_OVERRIDE);
+    POSE.look.set(...(CABIN_TARGET_OVERRIDE ?? CABIN_TARGET));
+  } else if (!INTERIOR_VIEWS?.[slot]) {
+    POSE.offset.set(...CABIN_EYE);
+    POSE.look.set(...CABIN_TARGET);
+  } else {
+    const v = INTERIOR_VIEWS[slot];
+    // 装配层给的是**装配局部坐标**（spec 口径：+Z 车头）。运行时 POSE 是**世界偏移**
+    // （Game 传入的 carQuat 取 root.quaternion = 恒等，车身 π 偏航在 body 内部），
+    // 两者差一个绕 Y 的 180°：x、z 全部取反。内置 CABIN_EYE 已是反好的世界值。
+    POSE.offset.set(-v.eye[0], v.eye[1], -v.eye[2]);
+    POSE.look.set(-v.target[0], v.target[1], -v.target[2]);
+  }
+  POSE.fov = 68;
+  POSE.k = 4;
+  POSE.near = CABIN_NEAR;
+  POSE.local = true;
+}
+/** 自由视角限位：偏航 ±225°（可绕到车后再多半圈）、俯仰 ±63°（防过顶翻转/钻地） */
+const YAW_LIMIT = Math.PI * 1.25;
+const PITCH_LIMIT = 1.1;
+
+/* 纽北改造：free 机位的世界边界钳位（旧城走廊 BOUNDS/corridorHalfWidth）随
+ * core/FreeDrive 一起下线 —— 本作没有城市走廊，护栏由 Drive 的 |lateral|>10.6 承担。 */
+
+/* ── R110 · 柔化碰撞抖动（探测实证「僵硬」四根因之一/二/三的通用修）──────────
+ * 原实现瞬时起步 + 线性硬衰减 + 高频 sin 直叠 position ⇒ 用户读作「僵硬的
+ * 碰撞时镜头抖动」。这里只改**通用实现**一处，全场景注入点同时生效：
+ *  · SHAKE_TAU：指数衰减时间常数（τ=0.18 ⇒ 0.8 抖到 0.1 约 0.55s，比线性
+ *    平滑且结尾软收敛，不硬切）。取代 :619/:560 的 `shake -= dt*1.4`。
+ *  · SHAKE_MAX：幅度上限，防 0.8 级注入爆幅（叠加 0.45 → 抖幅上限 0.225m）。 */
+const SHAKE_TAU = 0.18;
+const SHAKE_MAX = 0.45;
+/* R162 · 撞击 shake 攻击斜坡：施加幅度从 0 缓升到 shake 包络（τ=0.04 ≈ 3 帧 @60fps），
+ * 消除撞帧满幅瞬跳「两帧无过渡突兀」。攻击斜坡只作用于施加幅度（shakeAmp），
+ * 包络/取大/衰减语义（SHAKE_TAU/SHAKE_MAX/addShake）不动。 */
+const SHAKE_ATTACK_TAU = 0.04;
+/* R164 · 撞击 FOV punch：碰撞帧视场被"撞"的瞬时冲击（比位置震屏更贴撞击体感）。
+ * FOV_PUNCH_TAU：冲击包络指数回落（τ=0.14 ⇒ 约 200ms 收敛）；
+ * FOV_PUNCH_ATTACK_TAU：施加幅度攻击缓升（τ=0.03 ⇒ ≈2 帧 @60fps），与 SHAKE_ATTACK_TAU 同理防撞帧瞬跳；
+ * FOV_PUNCH_MAX：冲击上限（度），防 0.5×20=10° 封顶；
+ * FOV_PUNCH_DEG_PER_SHAKE：每单位 shake 强度映射的 FOV 度数（撞击强度→视场冲击）。 */
+const FOV_PUNCH_TAU = 0.14;
+const FOV_PUNCH_ATTACK_TAU = 0.03;
+const FOV_PUNCH_MAX = 10;
+const FOV_PUNCH_DEG_PER_SHAKE = 20;
+
+export class CameraRig {
+  camera: THREE.PerspectiveCamera;
+  mode: CameraMode = 'orbit';
+  /** R84 · 车型标记：R7 车身比 V800 短 0.47m ⇒ hood 机位需独立 z/y（见 R7_HOOD_Z 注）。
+   *  Game.ts 现有 `new CameraRig(aspect)` 不传第 2 参 ⇒ 默认 v800 ⇒ 不破 V800 行为。
+   *  R7 接线：Game.ts 需在 R7 模式下传 `new CameraRig(aspect, 'r7')`（主理人兜底接线）。 */
+  private shake = 0;
+  /** R162 · 施加幅度（攻击缓升用）：shakeAmp 以 SHAKE_ATTACK_TAU 向 shake 包络收敛，
+   *  施加偏移用 shakeAmp 而非 shake ⇒ 撞帧满幅不瞬跳（≈3 帧缓升到包络）。 */
+  private shakeAmp = 0;
+  /** R164 · 撞击 FOV punch：fovBase 为 FOV 收敛基线（punch 不污染 lerp 状态，防二次叠加）；
+   *  fovPunch 为冲击包络（指数回落），fovPunchAmp 为施加幅度（攻击缓升）。 */
+  private fovBase = 55;
+  private fovPunch = 0;
+  private fovPunchAmp = 0;
+  private time = 0;
+  private offset = new THREE.Vector3(6, 1.6, 6);
+  private lookOffset = new THREE.Vector3(0, 0.85, 0);
+  private anchor = new THREE.Vector3();
+  /** R65 · 照片模式方向键平移偏移（世界系）。加到相机位与注视点 ⇒ 平移不旋转视线。 */
+  private panOffset = new THREE.Vector3();
+  /**
+   * R71 · 照片模式自由飞行状态（相机脱离车锚点，全世界游动）。
+   * flyPos 为世界坐标；flyYaw/flyPitch 由视线反解，驱动 lookAt 而非 Spherical 环绕。
+   * flyActive=true 时 update() 走早退分支，绕过 anchor+offset 绕车链路与 free 世界钳位。
+   */
+  private flyPos = new THREE.Vector3();
+  private flyYaw = 0;
+  private flyPitch = 0;
+  private flyActive = false;
+  private tmpOffset = new THREE.Vector3();
+  private tmpLook = new THREE.Vector3();
+  /** 自由视角：用户拖拽产生的偏航/俯仰偏移与缩放（双击或切机位复位） */
+  private userYaw = 0;
+  private userPitch = 0;
+  private userZoom = 1;
+  private dragging = false;
+  private tmpSph = new THREE.Spherical();
+  private tmpRight = new THREE.Vector3();
+  /** 车型视距微调（profile.cameraScale ?? 1），只作用于外部机位 */
+  private viewScale = 1;
+  /**
+   * 涉内机位切换的落位标志（R31 C 线修「座舱黑屏」真因）：
+   * 外部↔内部切换时相机必须穿越车体，指数阻尼的 0.4~8s 过渡期全程相机位于壳体
+   * 内部/背后 —— FrontSide 把外板背面剔除、内舱漆是暗面克隆 ⇒ 满屏黑/暗带，
+   * 数秒后才收敛到正确眼点。R19 起该现象被反复误报为「座舱黑屏回归」
+   * （根因是过渡期而非稳态；QA 截图早于收敛也会采到同一假象）。
+   * 置位后下一帧 offset/lookOffset 直接落位（s=1），不做穿越式过渡；
+   * 外部↔外部切换不受影响，保留原平滑阻尼。
+   */
+  private snapPose = false;
+
+  constructor(aspect: number) {
+    this.camera = new THREE.PerspectiveCamera(55, aspect, 0.1, 12000);
+    this.camera.position.copy(this.offset);
+  }
+
+  /**
+   * 注入装配局部坐标的三个内饰机位（CarLike.interiorViews?）。
+   * 传 null / 未调用 → cabinDriver/Passenger/Rear 退回内置 cabin 偏移（不会白屏）。
+   */
+  setInteriorViews(views: InteriorViews | null): void {
+    INTERIOR_VIEWS = views;
+  }
+
+  /** 车型视距微调（profile.cameraScale；默认 1 = 原机位距离） */
+  setViewScale(scale: number): void {
+    this.viewScale = scale > 0 ? scale : 1;
+  }
+
+  setMode(mode: CameraMode): void {
+    // 外部↔内部（或反向）切换：首帧落位，避免相机穿越车体时的满屏黑过渡期
+    if (isInteriorMode(this.mode) !== isInteriorMode(mode)) this.snapPose = true;
+    this.mode = mode;
+    // 切机位（V 键 / HUD 按钮 / 结算自动机位）时自由视角归零
+    this.resetLook();
+  }
+
+  addShake(amount: number): void {
+    // R110：保留「取大」合并语义（多源叠加），加幅度上限防爆幅
+    this.shake = Math.min(SHAKE_MAX, Math.max(this.shake, amount));
+  }
+
+  /** R164 · 撞击 FOV punch：多源取大合并 + 上限（与 addShake 同语义），
+   *  shakeAmount 与 addShake 同源 ⇒ 调用处并排写 addShake(x); addFovPunch(x)。 */
+  addFovPunch(shakeAmount: number): void {
+    this.fovPunch = Math.min(
+      FOV_PUNCH_MAX,
+      Math.max(this.fovPunch, shakeAmount * FOV_PUNCH_DEG_PER_SHAKE)
+    );
+  }
+
+  /** 拖拽增量：dx→偏航，dy→俯仰（外部机位为环绕惯例：上拖 = 相机升高俯视）。
+   *  R71 自由飞行态：直接驱动 flyYaw/flyPitch（FPS 惯例：右拖右转、上拖抬视线），
+   *  不走 Spherical 环绕 ⇒ 照片模式鼠标拖拽仍可转视线。 */
+  addLook(dx: number, dy: number): void {
+    this.dragging = true;
+    if (this.flyActive) {
+      this.flyYaw -= dx * 0.005;
+      this.flyPitch = clamp(this.flyPitch - dy * 0.004, -1.45, 1.45); // 防过顶/穿地（±83°）
+      return;
+    }
+    this.userYaw = clamp(this.userYaw - dx * 0.005, -YAW_LIMIT, YAW_LIMIT);
+    this.userPitch = clamp(this.userPitch + dy * 0.004, -PITCH_LIMIT, PITCH_LIMIT);
+  }
+
+  endLook(): void {
+    this.dragging = false;
+  }
+
+  /** 滚轮 / 捏合缩放（仅外部机位生效）。
+   *  R71 自由飞行态：滚轮映射为沿视线前后移动 flyPos（推近/拉远），不改 FOV。 */
+  addZoom(deltaY: number): void {
+    if (this.flyActive) {
+      const cp = Math.cos(this.flyPitch);
+      const step = deltaY > 0 ? -1.5 : 1.5; // 上滚(拉远)为正前进的逆：deltaY>0 = 后退
+      this.flyPos.x += -Math.sin(this.flyYaw) * cp * step;
+      this.flyPos.y = Math.max(0.2, this.flyPos.y + Math.sin(this.flyPitch) * step);
+      this.flyPos.z += -Math.cos(this.flyYaw) * cp * step;
+      return;
+    }
+    this.userZoom = clamp(this.userZoom * (deltaY > 0 ? 1.1 : 0.9), 0.55, 2.2);
+  }
+
+  resetLook(): void {
+    this.userYaw = 0;
+    this.userPitch = 0;
+    this.userZoom = 1;
+    this.dragging = false;
+  }
+
+  /** R65 · 照片模式方向键平移：按相机右向/前向(水平投影)/上向平移 panOffset。
+   *  strafe 左右沿右向、fwd 前后沿视线水平投影、up 升降。世界系累计，逐帧调小步长。
+   *  平移相机+注视点 ⇒ 场景自由移动而非控制车辆（车由 FreeDrive.photoMode 冻结）。
+   *  R71 自由飞行态：平移量加到 flyPos（沿 flyYaw 水平朝向算前后/左右），脱离车锚点。 */
+  pan(strafe: number, fwd: number, up: number, dt: number): void {
+    const speed = 6; // m/s
+    const step = speed * dt;
+    const cam = this.camera;
+    if (this.flyActive) {
+      const sy = Math.sin(this.flyYaw);
+      const cy = Math.cos(this.flyYaw);
+      // forward_h = (-sin yaw, -cos yaw)，right = forward_h × up = (cos yaw, -sin yaw)
+      this.flyPos.x += (cy * strafe - sy * fwd) * step;
+      this.flyPos.z += (-sy * strafe - cy * fwd) * step;
+      this.flyPos.y = Math.max(0.2, this.flyPos.y + up * step); // 防钻地
+      return;
+    }
+    // 右向 = 视线 × 上，水平投影归一
+    const fwdV = this.tmpLook.copy(cam.getWorldDirection(this.tmpRight)).setY(0).normalize();
+    const rightV = this.tmpRight.crossVectors(fwdV, UP).normalize();
+    this.panOffset.addScaledVector(rightV, strafe * step);
+    this.panOffset.addScaledVector(fwdV, fwd * step);
+    this.panOffset.y = Math.max(0.2, this.panOffset.y + up * step); // 防钻地
+  }
+
+  resetPan(): void {
+    this.panOffset.set(0, 0, 0);
+  }
+
+  /** R71 · 进入照片模式：以当前相机位姿播种自由飞行（flyPos=眼点，yaw/pitch 由视线反解）。
+   *  `#r71freefly=off` 时 no-op，保持绕车轨道。 */
+  beginFly(): void {
+    if (FREE_FLY_DISABLED) return;
+    const cam = this.camera;
+    this.flyPos.copy(cam.position);
+    const d = cam.getWorldDirection(this.tmpRight);
+    this.flyPitch = Math.asin(clamp(d.y, -1, 1));
+    this.flyYaw = Math.atan2(-d.x, -d.z);
+    this.flyActive = true;
+  }
+
+  /** R71 · 退出照片模式：交还绕车轨道（flyActive=false，flyPos/flyYaw/flyPitch 保留待复用）。 */
+  endFly(): void {
+    this.flyActive = false;
+  }
+
+  get isDragging(): boolean {
+    return this.dragging;
+  }
+
+  /** 只读锚点（perf-r14 帧探针判定相机-车相对位移用；外部勿写） */
+  get anchorView(): THREE.Vector3 {
+    return this.anchor;
+  }
+
+  update(dt: number, target: THREE.Vector3, speed: number, carQuat: THREE.Quaternion = IDENT): void {
+    const cam = this.camera;
+    const portrait = cam.aspect < 1;
+    this.time += dt;
+    MODES[this.mode](speed, portrait, this.time);
+    const pose = POSE;
+
+    // R71 · 照片模式自由飞行早退分支：相机脱离车锚点，全世界游动。绕过 anchor+offset
+    // 绕车链路、绕过 free 世界钳位；near/fov 写回仍沿用当前机位 POSE。
+    if (this.flyActive) {
+      const cp = Math.cos(this.flyPitch);
+      const dir = this.tmpLook.set(
+        -Math.sin(this.flyYaw) * cp,
+        Math.sin(this.flyPitch),
+        -Math.cos(this.flyYaw) * cp
+      );
+      const lookPt = this.tmpOffset.copy(this.flyPos).add(dir);
+      cam.position.copy(this.flyPos);
+      this.shake *= Math.exp(-dt / SHAKE_TAU);
+      if (this.shake < 1e-4) this.shake = 0;
+      // R162 · 飞航态不施加偏移，但保持 shakeAmp 跟随包络 ⇒ 退出飞航不残留满幅。
+      this.shakeAmp += (this.shake - this.shakeAmp) * (1 - Math.exp(-dt / SHAKE_ATTACK_TAU));
+      if (this.shakeAmp < 1e-4) this.shakeAmp = 0;
+      // R164 · 飞航态不施加 FOV punch，但保持 fovBase/fovPunchAmp 跟随 ⇒ 退出飞航连续。
+      this.fovBase += (pose.fov - this.fovBase) * Math.min(1, dt * 2);
+      this.fovPunch *= Math.exp(-dt / FOV_PUNCH_TAU);
+      if (this.fovPunch < 1e-4) this.fovPunch = 0;
+      this.fovPunchAmp += (this.fovPunch - this.fovPunchAmp) * (1 - Math.exp(-dt / FOV_PUNCH_ATTACK_TAU));
+      if (this.fovPunchAmp < 1e-4) this.fovPunchAmp = 0;
+      cam.lookAt(lookPt);
+      if (cam.near !== pose.near) {
+        cam.near = pose.near;
+        cam.updateProjectionMatrix();
+      }
+      const fov = cam.fov + (pose.fov - cam.fov) * Math.min(1, dt * 2);
+      if (Math.abs(fov - cam.fov) > 0.001) {
+        cam.fov = fov;
+        cam.updateProjectionMatrix();
+      }
+      return;
+    }
+
+    // 局部视角（hood/cabin*/side）偏移随车体朝向旋转
+    const q = pose.local ? carQuat : IDENT;
+    const off = this.tmpOffset.copy(pose.offset).applyQuaternion(q);
+    const look = this.tmpLook.copy(pose.look).applyQuaternion(q);
+    // 车型视距微调（profile.cameraScale，默认 1）：只作用于**外部**机位的机位距离，
+    // 车内机位不动 —— 眼点是装配给的实测坐标，缩放会把相机塞进座椅/台面里。
+    if (this.viewScale !== 1 && !isInteriorMode(this.mode)) off.multiplyScalar(this.viewScale);
+
+    // 自由视角覆盖层：第一人称（hood/cabin*）偏转视线方向；外部机位绕锚点环绕 + 缩放。
+    // 叠加在既有阻尼机位系统之上，不改动任何原插值逻辑（每帧零分配）。
+    if (this.userYaw !== 0 || this.userPitch !== 0 || this.userZoom !== 1) {
+      if (isInteriorMode(this.mode) || this.mode === 'hood') {
+        if (this.userYaw !== 0) look.applyAxisAngle(UP, this.userYaw);
+        if (this.userPitch !== 0) {
+          const right = this.tmpRight.copy(look).cross(UP).normalize();
+          look.applyAxisAngle(right, -this.userPitch); // 上拖 = 抬视线
+        }
+      } else {
+        const sph = this.tmpSph.setFromVector3(off);
+        sph.theta += this.userYaw;
+        sph.phi = clamp(sph.phi + this.userPitch, 0.2, Math.PI - 0.2); // 防过顶/穿地
+        off.setFromSpherical(sph).multiplyScalar(this.userZoom);
+      }
+    }
+
+    // 锚点**直接跟随**（perf-r14）：原实现 anchor.lerp(target, 1-exp(-dt*anchorK))
+    // 在 anchorK=5 下形成 v/5 的稳态滞后（30 m/s → 6 m、55 m/s → 11 m），
+    // 且滞后量随加速持续漂移 = 相机-车相对位移单向拉长（仿真实测 3s 内 3.0 m /
+    // 满载 11 m）。这层二次阻尼没有任何构图收益（构图由 pose.offset 决定），
+    // 却让「车距」变成速度的函数、并把任何 dt 抖动直接写进相对位移。
+    // 改为刚性跟随：机位切换的平滑仍由下面的 offset/lookOffset 指数阻尼负责。
+    this.anchor.copy(target);
+    // 指数阻尼 → 模式切换约 0.4~0.6s 内收敛，不瞬跳；
+    // 涉内机位切换（snapPose）例外：s=1 直接落位，不穿越车体（见字段注释）。
+    const s = this.snapPose ? 1 : 1 - Math.exp(-dt * pose.k);
+    this.snapPose = false;
+    this.offset.lerp(off, s);
+    this.lookOffset.lerp(look, Math.min(1, s * 1.5));
+    cam.position.copy(this.anchor).add(this.offset);
+    // R65 · 照片模式方向键平移：把相机与其注视点一起平移 panOffset ⇒ 场景自由移动
+    //   （控相机不控车，车由 FreeDrive.photoMode 冻结）。加在 anchor+offset 之后、
+    //   lookAt 之前 ⇒ 平移不旋转视线；free 机位边界钳位在其后仍生效（pan 后再钳）。
+    if (this.panOffset.x !== 0 || this.panOffset.y !== 0 || this.panOffset.z !== 0) {
+      cam.position.add(this.panOffset);
+    }
+    this.shake *= Math.exp(-dt / SHAKE_TAU);
+    if (this.shake < 1e-4) this.shake = 0;
+    // R162 · 攻击斜坡：施加幅度以 SHAKE_ATTACK_TAU 向包络收敛（撞帧不从 0 瞬跳满幅）。
+    // 只作用于施加幅度，包络（shake）/取大/衰减语义不动。
+    this.shakeAmp += (this.shake - this.shakeAmp) * (1 - Math.exp(-dt / SHAKE_ATTACK_TAU));
+    if (this.shakeAmp < 1e-4) this.shakeAmp = 0;
+    if (this.shakeAmp > 0) {
+      // R110 · 频率降 + 高频项缩幅 + 总幅值减半：主频 23.3→9.0、41.7→17.0、
+      // 29.1→10.5、47.9→19.0（≈1.4~3.0Hz，避开被读作僵硬的高频区）；
+      // 系数 0.6/0.4 → 0.72/0.28（低主频占比）；总幅值 ×0.5。
+      // 配合 SHAKE_MAX=0.45 ⇒ max 抖幅 ≈0.45×0.5=0.225m（旧 0.4m 更柔）。
+      const t = this.time;
+      const sh = this.shakeAmp;
+      cam.position.x += sh * (Math.sin(t * 9.0) * 0.72 + Math.sin(t * 17.0 + 1.3) * 0.28) * 0.5;
+      cam.position.y += sh * (Math.sin(t * 10.5 + 0.7) * 0.72 + Math.sin(t * 19.0 + 2.1) * 0.28) * 0.5;
+    }
+    cam.lookAt(
+      this.anchor.x + this.lookOffset.x + this.panOffset.x,
+      this.anchor.y + this.lookOffset.y + this.panOffset.y,
+      this.anchor.z + this.lookOffset.z + this.panOffset.z
+    );
+    // cabin 系 near 由 R71 提到 0.1（CABIN_NEAR，根治方向盘黑帧）；其余模式维持 0.1
+    if (cam.near !== pose.near) {
+      cam.near = pose.near;
+      cam.updateProjectionMatrix();
+    }
+    // R164 · 撞击 FOV punch：FOV 用独立基线 fovBase 收敛（punch 不污染 lerp 状态，
+    // 防「lerp 回拉 + 再叠加」二次膨胀），撞击时在基线叠加瞬时冲击 fovPunchAmp；
+    // punch→0 ⇒ cam.fov→fovBase→pose.fov（空闲行为与旧逐位一致）。
+    this.fovBase += (pose.fov - this.fovBase) * Math.min(1, dt * 2);
+    this.fovPunch *= Math.exp(-dt / FOV_PUNCH_TAU);
+    if (this.fovPunch < 1e-4) this.fovPunch = 0;
+    this.fovPunchAmp += (this.fovPunch - this.fovPunchAmp) * (1 - Math.exp(-dt / FOV_PUNCH_ATTACK_TAU));
+    if (this.fovPunchAmp < 1e-4) this.fovPunchAmp = 0;
+    const fovFinal = this.fovBase + this.fovPunchAmp;
+    if (Math.abs(fovFinal - cam.fov) > 0.001) {
+      cam.fov = fovFinal;
+      cam.updateProjectionMatrix();
+    }
+  }
+
+  resize(aspect: number): void {
+    this.camera.aspect = aspect;
+    this.camera.updateProjectionMatrix();
+  }
+}

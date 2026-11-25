@@ -1,0 +1,76 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
+  <meta name="theme-color" content="#120a0c" />
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Ccircle cx='16' cy='16' r='13' fill='none' stroke='%23e0463c' stroke-width='4'/%3E%3C/svg%3E" />
+  <title>纽博格林北环 · 尊界V800 自由驾驶</title>
+  <style>
+    /* 第三方许可署名（MIT / Apache-2.0 均要求保留版权与许可声明） */
+    #credits {
+      position: fixed;
+      left: 0;
+      right: 0;
+      bottom: 0;
+      z-index: 5;
+      padding: 4px 10px 5px;
+      text-align: center;
+      font-size: 11px;
+      letter-spacing: 0.2px;
+      color: rgba(241, 220, 174, 0.5);
+      pointer-events: none;
+    }
+    #credits a { color: inherit; text-decoration: none; pointer-events: auto; }
+    #credits a:hover { color: var(--cream, #f1dcae); text-decoration: underline; }
+  </style>
+  <script>
+    // 运行时错误出口（QA）：无头/远程会话拿不到 console 时，把首个错误写进
+    // document.title（可用 tab_title 读取）并把加载屏改成错误文本 —— 不让失败静默。
+    (function () {
+      function report(msg) {
+        window.__nrErr = msg;
+        try { document.title = 'ERR: ' + msg; } catch (e) {}
+        var l = document.getElementById('loading');
+        if (l && l.parentNode) {
+          l.classList.remove('done');
+          l.innerHTML = '<div class="loading-text" style="color:#ff6a3d">ERR: ' + msg + '</div>';
+        }
+      }
+      addEventListener('error', function (e) {
+        if (e && e.message) report(e.message + ' @' + (e.filename || '') + ':' + (e.lineno || 0));
+      });
+      addEventListener('unhandledrejection', function (e) {
+        var r = e && e.reason;
+        report('unhandledrejection: ' + (r && (r.stack || r.message) ? (r.message || r.stack) : String(r)));
+      });
+    })();
+  </script>
+  <script>
+    // QA 钩子：URL hash 含 rafpump 时启用（仅无头/后台受控浏览器用，正常用户不受影响）。
+    // 后台标签 Chromium 的 rAF 停转（见 docs/PERF.md §7），用 Worker 定时器泵替代 rAF 驱动循环，
+    // 使 CI / 无头环境可完整自动跑局并实测 calls/tris。
+    if (location.hash.includes('rafpump')) {
+      const queue = [];
+      const workerSrc = 'setInterval(() => self.postMessage(0), 16);';
+      const worker = new Worker(URL.createObjectURL(new Blob([workerSrc], { type: 'application/javascript' })));
+      window.requestAnimationFrame = (cb) => { queue.push(cb); return queue.length; };
+      worker.onmessage = () => {
+        if (queue.length === 0) return;
+        const cbs = queue.splice(0);
+        const t = performance.now();
+        for (const cb of cbs) { try { cb(t); } catch (e) { console.error(e); } }
+      };
+    }
+  </script>
+</head>
+<body>
+  <div id="app"></div>
+  <div id="hud" class="hidden"></div>
+  <div id="menu" class="hidden"></div>
+  <div id="result" class="hidden"></div>
+  <div id="loading"><div class="loading-text">NORDSCHLEIFE · 场景构建中…</div></div>
+  <div id="credits">基于 <a href="https://threejs.org" target="_blank" rel="noreferrer">three.js</a>（MIT） · <a href="https://www.typescriptlang.org" target="_blank" rel="noreferrer">TypeScript</a>（Apache-2.0）构建 · 几何/音效/环境贴图程序化生成，车模座舱 7 张表面贴图为第三方宣传图衍生裁片（<a href="https://github.com/Rickeal-Boss/Ultimate-Design-V800/blob/main/docs/ASSETS.md" target="_blank" rel="noreferrer">资产登记 §9</a>）</div>
+  <script type="module" src="/src/main.ts"></script>
+</body>
+</html>
