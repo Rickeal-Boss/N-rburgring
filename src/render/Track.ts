@@ -5,7 +5,7 @@
  *   |x| ≤ 7        石板铺装（三带贴图，u=0..1，v=s/12 ⇒ 与旧仓 2.4m 条石同密度）
  *   7 < |x| ≤ 8.4  白石路缘（抬高 0.03）
  *   8.4 < |x| ≤ 11.6 土路肩（soil 贴图，向外压低 0.35）
- *   |x| = 11.2     护栏（立柱 InstancedMesh 每 8m + 连续波形梁 ribbon）
+ *   |x| = 11.2     护栏（立柱 InstancedMesh 每 5m + 双梁 ribbon）
  *
  * 所有几何体沿**弧长**逐段生成（不能只放一个中心），三角绕序朝上：
  * 每段四边形 `[L0, L1, R0] + [R0, L1, R1]`，其中 L 为左列、R 为右列、0/1 为前/后环。
@@ -171,11 +171,11 @@ export class Track {
     this.group.add(shoulder);
 
     /* ── 护栏（横梁 ribbon + 立柱 InstancedMesh）────────────────────────
-     * 横梁：x=±11.2 的竖直薄带（y 0.56~0.68，0.12 厚），DoubleSide 单面片。
-     * 立柱：每 8m 一根，坐落在土路肩（11.2 处 ≈ −0.32）上、顶端探到横梁上沿 ——
-     *   箱体高 1.05（地下 0.35 + 地上 0.70），故横梁 0.62 与立柱上段自然搭接。
-     *   （规格给的 0.75 只覆盖地上段；此处按「埋入土路肩」的真实构造取 1.05，
-     *    否则立柱顶 0.43 会与 0.62 的横梁脱空。） */
+     * 横梁：x=±11.2 的**双梁**竖直薄带 —— 下梁 y 0.43~0.53、上梁 y 0.73~0.83
+     *   （各 0.10 厚，中心 0.48 / 0.78），DoubleSide 单面片，合并成 1 个 mesh（1 DC）。
+     * 立柱：每 **5m** 一根，坐落在土路肩（11.2 处 ≈ −0.31）上、顶端探到上梁上沿 ——
+     *   箱体 0.16×1.32×0.16（地上 1.16 到 y=0.85 + 地下 0.16 埋入路肩），中心取
+     *   local y = 0.19 ⇒ 底 −0.47 / 顶 0.85，上下梁（0.43~0.83）均被立柱贯穿搭接。 */
     const railMat = new THREE.MeshStandardMaterial({
       color: RAIL_GREY,
       roughness: 0.55,
@@ -184,8 +184,10 @@ export class Track {
     });
     this.materials.push(railMat);
     const beamGeo = mergeSafe([
-      buildRibbon(strip(-11.2, 0.56, -11.2, 0.68), 4, 4),
-      buildRibbon(strip(11.2, 0.56, 11.2, 0.68), 4, 4)
+      buildRibbon(strip(-11.2, 0.43, -11.2, 0.53), 4, 4),
+      buildRibbon(strip(11.2, 0.43, 11.2, 0.53), 4, 4),
+      buildRibbon(strip(-11.2, 0.73, -11.2, 0.83), 4, 4),
+      buildRibbon(strip(11.2, 0.73, 11.2, 0.83), 4, 4)
     ]);
     this.geometries.push(beamGeo);
     const beam = new THREE.Mesh(beamGeo, railMat);
@@ -193,9 +195,9 @@ export class Track {
     beam.receiveShadow = true;
     this.group.add(beam);
 
-    const postGeo = new THREE.BoxGeometry(0.18, 1.05, 0.18);
+    const postGeo = new THREE.BoxGeometry(0.16, 1.32, 0.16);
     this.geometries.push(postGeo);
-    const postCount = Math.floor(track.length / 8) * 2;
+    const postCount = Math.floor(track.length / 5) * 2;
     const posts = new THREE.InstancedMesh(postGeo, railMat, postCount);
     posts.name = 'guardrail-posts';
     posts.castShadow = false;
@@ -214,9 +216,9 @@ export class Track {
       q.setFromAxisAngle(up, heading);
       for (const side of [-1, 1]) {
         p.set(
-          f.center.x + f.right.x * side * 11.2 + f.up.x * -0.32,
-          f.center.y + f.right.y * side * 11.2 + f.up.y * -0.32,
-          f.center.z + f.right.z * side * 11.2 + f.up.z * -0.32
+          f.center.x + f.right.x * side * 11.2 + f.up.x * 0.19,
+          f.center.y + f.right.y * side * 11.2 + f.up.y * 0.19,
+          f.center.z + f.right.z * side * 11.2 + f.up.z * 0.19
         );
         m.compose(p, q, one);
         posts.setMatrixAt(idx++, m);

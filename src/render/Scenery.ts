@@ -94,14 +94,26 @@ export class Scenery {
     const track = getTrack();
     const L = track.length;
 
-    /* ── 树：树干 cylinder + 树冠（两锥合并）────────────────────────────
+    /* ── 树：冷杉（两锥）+ 阔叶（压扁二十面体），62/38 混植 ──────────────
      * D2：每侧 **16m** 一棵（原先 24m）、左右交错 8m；确定性 LCG 抖动位置/缩放/朝向。
-     * 总数 = floor(L/16)*2 ≈ 2602，仍是 2 个 InstancedMesh（树干 / 树冠）。
-     * 单实例 12（干）+ 28（冠）= 40 tri。 */
+     * 总数 = floor(L/16)*2 ≈ 2600，按 ~62% 冷杉 / 38% 阔叶 随机分配（同种子可复现）。
+     * 冷杉单实例 12（干）+ 28（冠）= 40 tri；阔叶 12（短干）+ 80（Icosa(1.4,1)）= 92 tri。
+     * 4 个 InstancedMesh（干/冠 × 2 种，2 DC 新增），全部 castShadow=false。 */
     const rnd = makeLcg(80820832);
     const TREE_SPACING = 16;
     const perSide = Math.floor(L / TREE_SPACING);
     const treeCount = perSide * 2;
+
+    // 先掷一遍类型（62/38），按实际计数分配 InstancedMesh —— 保证 setMatrixAt 不越界
+    const coniferAt = new Uint8Array(treeCount);
+    let nConifer = 0;
+    for (let i = 0; i < treeCount; i++) {
+      const isConifer = rnd() < 0.62 ? 1 : 0;
+      coniferAt[i] = isConifer;
+      nConifer += isConifer;
+    }
+    const nBroad = treeCount - nConifer;
+
     const trunkGeo = new THREE.CylinderGeometry(0.18, 0.26, 2.6, 6, 1, true);
     trunkGeo.translate(0, 1.3, 0);
     const coneA = new THREE.ConeGeometry(1.9, 3.4, 7, 1, true);
@@ -109,20 +121,32 @@ export class Scenery {
     const coneB = new THREE.ConeGeometry(1.3, 2.4, 7, 1, true);
     coneB.translate(0, 5.2, 0);
     const canopyGeo = mergeSafe([coneA, coneB]);
-    this.geometries.push(trunkGeo, canopyGeo);
+
+    // 阔叶：短干 + 压扁树冠（y×0.75，冠底坐 1.8m 干顶）
+    const blTrunkGeo = new THREE.CylinderGeometry(0.16, 0.22, 1.8, 6, 1, true);
+    blTrunkGeo.translate(0, 0.9, 0);
+    const blCanopyGeo = new THREE.IcosahedronGeometry(1.4, 1);
+    blCanopyGeo.scale(1, 0.75, 1);
+    blCanopyGeo.translate(0, 1.8 + 1.4 * 0.75, 0); // 干顶 1.8 + 冠半高 1.05
+    this.geometries.push(trunkGeo, canopyGeo, blTrunkGeo, blCanopyGeo);
 
     const trunkMat = new THREE.MeshStandardMaterial({ color: 0x4a3a2c, roughness: 0.95 });
     const canopyMat = new THREE.MeshStandardMaterial({ color: 0x8a9a72, roughness: 0.92 });
-    this.materials.push(trunkMat, canopyMat);
+    const blCanopyMat = new THREE.MeshStandardMaterial({ color: 0x96a05c, roughness: 0.92 });
+    this.materials.push(trunkMat, canopyMat, blCanopyMat);
 
-    const trunks = new THREE.InstancedMesh(trunkGeo, trunkMat, treeCount);
-    const canopies = new THREE.InstancedMesh(canopyGeo, canopyMat, treeCount);
+    const trunks = new THREE.InstancedMesh(trunkGeo, trunkMat, nConifer);
+    const canopies = new THREE.InstancedMesh(canopyGeo, canopyMat, nConifer);
+    const blTrunks = new THREE.InstancedMesh(blTrunkGeo, trunkMat, nBroad);
+    const blCanopies = new THREE.InstancedMesh(blCanopyGeo, blCanopyMat, nBroad);
     trunks.name = 'tree-trunks';
     canopies.name = 'tree-canopies';
-    trunks.castShadow = false;
-    canopies.castShadow = false;
-    trunks.receiveShadow = false;
-    canopies.receiveShadow = false;
+    blTrunks.name = 'tree-broadleaf-trunks';
+    blCanopies.name = 'tree-broadleaf-canopies';
+    for (const im of [trunks, canopies, blTrunks, blCanopies]) {
+      im.castShadow = false;
+      im.receiveShadow = false;
+    }
 
     const m = new THREE.Matrix4();
     const q = new THREE.Quaternion();
@@ -130,46 +154,65 @@ export class Scenery {
     const p = new THREE.Vector3();
     const sc = new THREE.Vector3();
     const col = new THREE.Color();
-    let ti = 0;
+    let ci = 0;
+    let bi = 0;
+    let slot = 0;
     for (const side of [-1, 1]) {
       for (let i = 0; i < perSide; i++) {
         const s = i * TREE_SPACING + (side > 0 ? TREE_SPACING / 2 : 0) + (rnd() - 0.5) * 8;
         const lateral = side * (16 + rnd() * 39);
-        const scale = 0.75 + rnd() * 0.6;
+        const scale = 0.6 + rnd() * 0.9;
         terrainPoint(s, lateral, p);
         p.y -= 0.12; // 埋一点根，斜坡上不悬空
         e.set(0, rnd() * Math.PI * 2, 0);
         q.setFromEuler(e);
         sc.set(scale, scale * (0.85 + rnd() * 0.35), scale);
         m.compose(p, q, sc);
-        trunks.setMatrixAt(ti, m);
-        canopies.setMatrixAt(ti, m);
-        // 冠色（D2）：灰绿 → 深橄榄，明度 0.14~0.22 / 饱和 0.25~0.40（线性空间；
-        // 乘上 canopyMat 0x8a9a72 后落在暗橄榄，不再是荧光浅绿）
-        col.setHSL(0.24 + rnd() * 0.06, 0.25 + rnd() * 0.15, 0.14 + rnd() * 0.08);
-        canopies.setColorAt(ti, col);
-        ti++;
+        if (coniferAt[slot]) {
+          trunks.setMatrixAt(ci, m);
+          canopies.setMatrixAt(ci, m);
+          // 冷杉：色相 0.24~0.32 / 明度 0.14~0.24 / 饱和 0.25~0.40（线性空间；
+          // 乘 canopyMat 0x8a9a72 落暗橄榄，不再是荧光浅绿）
+          col.setHSL(0.24 + rnd() * 0.08, 0.25 + rnd() * 0.15, 0.14 + rnd() * 0.10);
+          canopies.setColorAt(ci, col);
+          ci++;
+        } else {
+          blTrunks.setMatrixAt(bi, m);
+          blCanopies.setMatrixAt(bi, m);
+          // 阔叶：暖绿 色相 0.20~0.30 / 明度 0.16~0.26 / 饱和 0.30~0.45
+          col.setHSL(0.20 + rnd() * 0.10, 0.30 + rnd() * 0.15, 0.16 + rnd() * 0.10);
+          blCanopies.setColorAt(bi, col);
+          bi++;
+        }
+        slot++;
       }
     }
-    trunks.instanceMatrix.needsUpdate = true;
-    canopies.instanceMatrix.needsUpdate = true;
-    if (canopies.instanceColor) canopies.instanceColor.needsUpdate = true;
-    trunks.computeBoundingSphere();
-    canopies.computeBoundingSphere();
-    group.add(trunks, canopies);
+    for (const im of [trunks, canopies, blTrunks, blCanopies]) {
+      im.instanceMatrix.needsUpdate = true;
+      if (im.instanceColor) im.instanceColor.needsUpdate = true;
+      im.computeBoundingSphere();
+    }
+    group.add(trunks, canopies, blTrunks, blCanopies);
 
-    /* ── 岩石：dodecahedron ~300（|x| ∈ [20,120]）──────────────────────── */
+    /* ── 岩石：dodecahedron ~300（|x| ∈ [20,120]）+ 巨石簇 ────────────────
+     * 巨石簇（B2）：4 处 × 3~5 块（|x|∈[18,60]，块径 1.2~2.6m），并入现 rocks
+     * InstancedMesh（只加实例数，不加 DC）。簇位/块形用独立 LCG rnd2 —— 不扰动
+     * 主 rnd 序列，原 300 散石与树/牌/废墟布局逐点不变。 */
     const rockGeo = new THREE.DodecahedronGeometry(1, 0);
     this.geometries.push(rockGeo);
     const rockMat = new THREE.MeshStandardMaterial({ color: 0x9a958c, roughness: 0.92, metalness: 0.02 });
     this.materials.push(rockMat);
-    const rockCount = 300;
+    const RND2 = makeLcg(0x51f15e); // B2 新增散布专用 LCG
+    const SCATTER_BASE = 300;
+    const clusterSizes = [3, 4, 5, 4]; // 4 处，每簇 3~5 块
+    const clusterRocks = clusterSizes.reduce((a, b) => a + b, 0);
+    const rockCount = SCATTER_BASE + clusterRocks;
     const rocks = new THREE.InstancedMesh(rockGeo, rockMat, rockCount);
     rocks.name = 'rocks';
     rocks.castShadow = false;
     rocks.receiveShadow = false;
-    for (let i = 0; i < rockCount; i++) {
-      const s = (i / rockCount) * L + (rnd() - 0.5) * 20;
+    for (let i = 0; i < SCATTER_BASE; i++) {
+      const s = (i / SCATTER_BASE) * L + (rnd() - 0.5) * 20;
       const side = rnd() < 0.5 ? -1 : 1;
       const lateral = side * (20 + rnd() * 100);
       terrainPoint(s, lateral, p);
@@ -181,9 +224,82 @@ export class Scenery {
       m.compose(p, q, sc);
       rocks.setMatrixAt(i, m);
     }
+    let ri = SCATTER_BASE;
+    for (let c = 0; c < clusterSizes.length; c++) {
+      const cs = RND2() * L;
+      const cl = (RND2() < 0.5 ? -1 : 1) * (18 + RND2() * 42);
+      const baseY = terrainPoint(cs, cl, p).y;
+      for (let j = 0; j < clusterSizes[c]; j++) {
+        const s2 = (((cs + (RND2() - 0.5) * 6) % L) + L) % L;
+        const lateral2 = cl + (RND2() - 0.5) * 8;
+        terrainPoint(s2, lateral2, p);
+        p.y = baseY + (RND2() - 0.5) * 0.8 + 0.2;
+        e.set(RND2() * Math.PI, RND2() * Math.PI, RND2() * Math.PI);
+        q.setFromEuler(e);
+        const sx = 0.6 + RND2() * 0.7; // 半径 0.6~1.3 ⇒ 直径 1.2~2.6m
+        sc.set(sx, 0.45 + RND2() * 0.5, sx * (0.7 + RND2() * 0.5));
+        m.compose(p, q, sc);
+        rocks.setMatrixAt(ri++, m);
+      }
+    }
     rocks.instanceMatrix.needsUpdate = true;
     rocks.computeBoundingSphere();
     group.add(rocks);
+
+    /* ── 灌木（|x|∈[13,28]，~500，1 DC）──────────────────────────────── */
+    const shrubGeo = new THREE.IcosahedronGeometry(0.5, 0);
+    this.geometries.push(shrubGeo);
+    const shrubMat = new THREE.MeshStandardMaterial({ color: 0x51603f, roughness: 0.95 });
+    this.materials.push(shrubMat);
+    const SHRUB_COUNT = 500;
+    const shrubs = new THREE.InstancedMesh(shrubGeo, shrubMat, SHRUB_COUNT);
+    shrubs.name = 'shrubs';
+    shrubs.castShadow = false;
+    shrubs.receiveShadow = false;
+    for (let i = 0; i < SHRUB_COUNT; i++) {
+      const s = RND2() * L;
+      const side = RND2() < 0.5 ? -1 : 1;
+      const lateral = side * (13 + RND2() * 15);
+      terrainPoint(s, lateral, p);
+      p.y += 0.22;
+      e.set(0, RND2() * Math.PI * 2, 0);
+      q.setFromEuler(e);
+      const sx = 0.7 + RND2() * 0.9;
+      sc.set(sx, 0.6 + RND2() * 0.6, sx * (0.7 + RND2() * 0.5));
+      m.compose(p, q, sc);
+      shrubs.setMatrixAt(i, m);
+    }
+    shrubs.instanceMatrix.needsUpdate = true;
+    shrubs.computeBoundingSphere();
+    group.add(shrubs);
+
+    /* ── 草簇（|x|∈[12,20]，~800，1 DC）──────────────────────────────── */
+    const grassGeo = new THREE.ConeGeometry(0.22, 0.5, 4, 1, true);
+    grassGeo.translate(0, 0.25, 0); // 底面对齐地面
+    this.geometries.push(grassGeo);
+    const grassMat = new THREE.MeshStandardMaterial({ color: 0x8a8a54, roughness: 0.95 });
+    this.materials.push(grassMat);
+    const GRASS_COUNT = 800;
+    const grass = new THREE.InstancedMesh(grassGeo, grassMat, GRASS_COUNT);
+    grass.name = 'grass-tufts';
+    grass.castShadow = false;
+    grass.receiveShadow = false;
+    for (let i = 0; i < GRASS_COUNT; i++) {
+      const s = RND2() * L;
+      const side = RND2() < 0.5 ? -1 : 1;
+      const lateral = side * (12 + RND2() * 8);
+      terrainPoint(s, lateral, p);
+      p.y -= 0.02;
+      e.set(0, RND2() * Math.PI * 2, 0);
+      q.setFromEuler(e);
+      const gs = 0.7 + RND2() * 0.7;
+      sc.set(gs, gs * (0.8 + RND2() * 0.5), gs);
+      m.compose(p, q, sc);
+      grass.setMatrixAt(i, m);
+    }
+    grass.instanceMatrix.needsUpdate = true;
+    grass.computeBoundingSphere();
+    group.add(grass);
 
     /* ── 里程牌（每 1000m）+ 弯道提示牌（高曲率 8 处）────────────────── */
     this.buildMarkers(group, rnd);

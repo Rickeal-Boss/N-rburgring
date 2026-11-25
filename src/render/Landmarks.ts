@@ -37,20 +37,24 @@
  *   ⇒ 整帧 **+9 DC**（本管线每个可见 mesh 在整帧口径记 2 个 call）。
  *
  * ── 预算纪律 ───────────────────────────────────────────────────────────
- * 实测（tools 探针，`#assembled` 口径）：大门 ×2（高配）11,328 + 塔群复合体 ×3（低配）
- * 25,584 + 主殿 ×1（低配）11,300 + 火焰 392 ⇒ **+58,604 tri**（`mergeSafe` 后实计
- * 56,472 tri，差值是合并时三角化口径；以 `sceneStats` 的 56,472 为准）。
+ * 实测（`#assembled` 口径，等价于浏览器里 `sceneStats` 的逐 mesh 读数）：
+ *   landmark-ashlar 3,496 / ashlar-far 13,420 / gold 29,176 / dark 9,988 /
+ *   flame 392 ⇒ 合计 **56,472 tri**（预算 +350k，用掉 16%）。
  * 远景一律 `setDetailLevel(true)` 降装饰密度（**只降密度、不改几何尺寸**，castleKit
- * 铁律 33），近景大门走高配；`tier === 'low'` 时近景也降。
+ * 铁律 33），近景大门走高配；`tier === 'low'` 时近景也降（总数约 −40%）。
+ * ⚠ 别用「三个 maker 各自 tri 相加」复核本文件：`castleKit` 的桶里带模块级状态
+ * （`setDeepFar` / 低配档 / 变体桶），同一档位下单次调用与在 `new Landmarks()` 流程里
+ * 调用的读数会差零点几 %（实测 ashlar 近景：单测 3,525 vs 装配后 3,496）。
+ * **以 `landmark.meshes` 的读数为唯一口径。**
  */
 import * as THREE from 'three';
 import { getTrack } from '../track/nordschleife';
 import { mergeSafe } from '../util/geo';
 import { terrainPoint } from './Landscape';
 import { createAshlarTexture } from './scene/ashlarTexture';
-import { makeGate, makeMainHall, makeTowerGroup, setDetailLevel } from './scene/castleKit';
+import { box, makeGate, makeMainHall, makeTowerGroup, setDetailLevel } from './scene/castleKit';
 import type { StoneBuckets } from './scene/castleKit';
-import { GATE, MAIN_HALL } from './scene/r28Layout';
+import { GATE, MAIN_HALL, TOWER_GROUP } from './scene/r28Layout';
 
 /* ═══════════════════ 材质族（4 族 + 火焰 = ≤5 DC/组） ═══════════════════ */
 
@@ -145,11 +149,18 @@ const PLACEMENTS: readonly Placement[] = [
   { kind: 'gate', s: 2400, lateral: 0, scale: 1, yaw: 0, sink: -0.9, castShadow: true },
   { kind: 'gate', s: 13200, lateral: 0, scale: 1, yaw: 0, sink: -0.9, castShadow: true },
   // ── 城堡塔群 ×3（远景，低配，不投影）
-  { kind: 'castle', s: 5200, lateral: 70, scale: 0.9, yaw: 0, sink: -0.6, castShadow: false },
-  { kind: 'castle', s: 9800, lateral: -70, scale: 0.9, yaw: 0, sink: -0.6, castShadow: false },
-  { kind: 'castle', s: 17800, lateral: 70, scale: 1.0, yaw: 0, sink: -0.6, castShadow: false },
+  // C3（V-A 起伏后）：塔群在横坡上（外侧地形比内侧低 2~3m），flat 基座若只下沉 0.6m
+  // 会在远侧翼墙端头悬空 1.5~1.75m（probe 实测）。按足迹最低点反解 sink 加深到
+  // 「远侧触地、近侧埋入横坡」——近侧埋深 1.4~3.2m 是横坡 flat 基座的代价（读作
+  // 建筑嵌进山坡，非悬空）。塔群基座 y=40 咬合门楼 massTop=44，sink 只整体平移。
+  { kind: 'castle', s: 5200, lateral: 70, scale: 0.9, yaw: 0, sink: -2.4, castShadow: false },
+  { kind: 'castle', s: 9800, lateral: -70, scale: 0.9, yaw: 0, sink: -2.3, castShadow: false },
+  { kind: 'castle', s: 17800, lateral: 70, scale: 1.0, yaw: 0, sink: -1.2, castShadow: false },
   // ── 主殿 ×1（远景，低配，不投影；前脸转向路心）
-  { kind: 'hall', s: 19500, lateral: 150, scale: 1, yaw: Math.PI / 2, sink: -1.2, castShadow: false }
+  // C3：s=19500 lat150 处地形向远离路一侧急降（前段 min −14.33 / 后段 min −15.56），
+  // sink −1.2 时后段（低矮后排）悬空 ~1.9m。加深到 −2.8：前段（可见主立面）埋 0.5m+
+  // 触地，后排远处残余悬空 ≤0.3m（后段是 30m 低排，藏在高 96m 前脸之后）。
+  { kind: 'hall', s: 19500, lateral: 150, scale: 1, yaw: Math.PI / 2, sink: -2.8, castShadow: false }
 ];
 
 /**
@@ -161,6 +172,23 @@ const PLACEMENTS: readonly Placement[] = [
  * ⚠ 主殿**不得**套用（立面设计宽就是 210m）。
  */
 const WING_CROP_X = 57;
+
+/* ═══════════════════ C 阶段 · 主殿立面细节（C1） ═══════════════════ */
+
+/**
+ * C1 主殿立面细节尺寸（makeMainHall 内部 `wingH = 62` / `frontH = 96` 的可见读法）。
+ * ⚠ 这两个数在 castleKit 是**局部 const**（未导出），本文件按规格 C1 的
+ * 「0.8×0.8×立面高 / 每 ~12m 一根 / 每 ~24m 一组」重新表达。改 castleKit 的翼墙高
+ * 必须同步本常量（同 R12 铁律：改 extrude/尺寸真源必须同步依赖方）。
+ */
+const HALL_WING_H = 62; // 主殿翼墙高（= 0.65 × frontH 96）
+/** 翼墙窗龛带中心高：窗列顶（y40 + rise8 + cusp0.7 = 48.7）之上、叠涩（y62）之下 */
+const HALL_NICHE_Y = 53;
+/** 窗龛内衬（box 凹槽）尺寸：宽 ~2m × 高 ~7m */
+const HALL_NICHE_W = 2;
+const HALL_NICHE_H = 7;
+/** 中央段门楼两侧（x ±10..±44）窗龛带中心高（避开下方门拱饰、上方 y52 加密带） */
+const HALL_CENTRAL_NICHE_Y = 23.5;
 
 /* ═══════════════════ 组装 ═══════════════════ */
 
@@ -251,10 +279,17 @@ export class Landmarks {
     const builders: StoneBuckets[] = [];
     if (p.kind === 'hall') {
       builders.push(makeMainHall());
+      // C1：主殿立面细节（扶壁柱/窗龛/檐口压顶）——在 makeMainHall 产出坐标系生成，
+      // 走同一套归一化+帧矩阵 ⇒ 并入 ashlar-far / dark mesh（**+0 DC**）。
+      builders.push(this.hallFacadeBuckets());
     } else {
       builders.push(makeGate());
       // 塔群坐在门楼体量上（基座 y=40 咬合 massTop=44）⇒ 必须与门楼一起摆
-      if (p.kind === 'castle') builders.push(makeTowerGroup());
+      if (p.kind === 'castle') {
+        builders.push(makeTowerGroup());
+        // C2：塔群翼墙端头收口（±57m 裁剪面补 3m 厚端墙帽）——并入 ashlar-far（**+0 DC**）。
+        builders.push(this.wingCapBuckets());
+      }
     }
 
     // 局部原点 = 建筑中心（x 已对称）。y 不归一：三个 maker 的「地面」都正好 y=0
@@ -276,6 +311,76 @@ export class Landmarks {
         }
       }
     }
+  }
+
+  /**
+   * C1 主殿立面细节 —— 在 `makeMainHall` 的**产出坐标系**（前脸 z=MAIN_HALL.z=−1300、
+   * 地面 y=0、x 关于 0 对称、前脸朝 +z）里生成，走 `buildPlacement` 的归一化 + 帧矩阵。
+   *
+   * 目标（spec C1）：打破 210m 光秃石墙（两翼 ±44..±105 是裸墙主区）。
+   *   · 扶壁柱：每 ~12m 一根，0.8×0.8×立面高，前凸 0.5m（z 前脸 zFront+0.5，后缘嵌墙 0.3m）；
+   *   · 尖拱窗龛：box 凹槽（暗腔内衬），宽 ~2m 高 ~7m，每 ~24m 一组；
+   *   · 檐口压顶：顶沿 0.6m 收边（叠涩下沿补一道前凸压顶线）。
+   * 代价：全盒体 12 tri/件，共 **~360 tri**，**+0 DC**（并入既有 ashlar-far / dark mesh）。
+   * 低档守卫：装饰密度只降不涨 —— 两翼窗列（makeMainHall 内已有）低档自动降，
+   * 但本组是**纯盒体**，低档不裁（box 廉价，铁律 33 只约束花格窗/卷叶类）。
+   */
+  private hallFacadeBuckets(): StoneBuckets {
+    const b: StoneBuckets = { ashlar: [], wall: [], gold: [], dark: [], flame: [] };
+    const zFront = MAIN_HALL.z; // −1300（前脸）
+    // 扶壁柱/压顶中心：前凸 0.5m ⇒ 前脸 zFront+0.5、后缘嵌墙 0.3m（盒深 0.8）
+    const zB = zFront + 0.1;
+    const { wingInner, wingOuter } = MAIN_HALL;
+    const wingCx = (wingInner + wingOuter) / 2; // 74.5
+    const wingW = wingOuter - wingInner; // 61
+    const h = HALL_WING_H; // 62
+
+    /* ── 扶壁柱（每 ~12m 一根，0.8×0.8×立面高，前凸 0.5m）── */
+    for (const side of [-1, 1] as const) {
+      // 两翼裸墙：柱位取窗列**之间**（底窗 51.7/63.3/74.9/86.5/98.1，柱 48/60/72/84/96 避让 ≥1.2m）
+      for (const bx of [48, 60, 72, 84, 96]) {
+        b.ashlar.push(box('ashlar', 0.8, h, 0.8, side * bx, h / 2, zB));
+      }
+      // 中央段门楼两侧（x ±10..±44）扶壁柱：只到 y=52（其上 y52..96 是 R39 加密带，不再加）
+      for (const bx of [18, 30, 42]) {
+        b.ashlar.push(box('ashlar', 0.8, 52, 0.8, side * bx, 26, zB));
+      }
+    }
+
+    /* ── 尖拱窗龛（box 凹槽内衬，宽 ~2m 高 ~7m）── */
+    for (const side of [-1, 1] as const) {
+      // 两翼裸墙带（y49.5..56.5）：柱间 12m 节拍，读作"竖向节奏"的连续开窗
+      for (const nx of [54, 66, 78, 90]) {
+        b.dark.push(box('dark', HALL_NICHE_W, HALL_NICHE_H, 0.2, side * nx, HALL_NICHE_Y, zFront - 0.05));
+      }
+      // 中央段门楼两侧壁龛（y20..27）：柱间开窗，与门拱饰错开
+      for (const nx of [24, 36]) {
+        b.dark.push(box('dark', HALL_NICHE_W, HALL_NICHE_H, 0.2, side * nx, HALL_CENTRAL_NICHE_Y, zFront - 0.05));
+      }
+    }
+
+    /* ── 檐口压顶（顶沿 0.6m 收边：叠涩 y62 之下补一道前凸压顶线）── */
+    for (const side of [-1, 1] as const) {
+      b.ashlar.push(box('ashlar', wingW, 0.6, 0.8, side * wingCx, 61.4, zB));
+    }
+    return b;
+  }
+
+  /**
+   * C2 塔群翼墙端头收口 —— 在 ±57m 裁剪面（翼墙设计外缘 x=±55 的平口断面）补
+   * **3m 厚端墙帽**：与翼墙同高（TOWER_GROUP.wing.h=29）同深（8m）同材质（ashlar）。
+   * bbox 56.5 < WING_CROP_X 57 ⇒ 不被 `outsideCrop` 裁掉（±57 裁剪面在端墙帽外 0.5m）。
+   * 生成于 `makeTowerGroup` 产出坐标系（z=GATE.z、x 对称），走 `buildPlacement` 归一化。
+   * 代价：2 × 12 tri = **24 tri**，**+0 DC**（并入 ashlar-far mesh）。
+   */
+  private wingCapBuckets(): StoneBuckets {
+    const b: StoneBuckets = { ashlar: [], wall: [], gold: [], dark: [], flame: [] };
+    const wingX = TOWER_GROUP.wing.xEnd; // 55（翼墙外缘 = 平口断面）
+    const wingH = TOWER_GROUP.wing.h; // 29
+    for (const side of [-1, 1] as const) {
+      b.ashlar.push(box('ashlar', 3, wingH, 8, side * wingX, wingH / 2, GATE.z));
+    }
+    return b;
   }
 
   /** 越界件判定（见 `WING_CROP_X`）：整件丢弃，不按顶点裁 */

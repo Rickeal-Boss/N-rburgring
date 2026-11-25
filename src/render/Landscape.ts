@@ -6,7 +6,9 @@
  * 高程（相对路面中心平面）：
  *   |x|=8   −0.38  ← 低于土路肩外缘（−0.35），保证 3.2m 土带完整可见
  *   |x|=24  −0.45 ；60 −1.2 ；120 −2.2 ；220 −3.6 ；420 −7.0 ；800 −18 ；1400 −40
- *   |x| ∈ (60, 420] 叠加低频起伏（±2.4~4.5m，沿弧长取周期函数 ⇒ 闭合无接缝）
+ *   |x| ∈ (60, 1400] 叠加低频起伏（振幅 0.8~18m，spec A2 中/远场滚动；沿弧长取周期函数
+ *   ⇒ 闭合无接缝）；|x| ∈ (40, 300] 再叠 ~35m 波长 ±0.6m 高频小起伏（近中场呼吸感）。
+ *   ⚠ 铁律：|x|≤24m 所有起伏恒 0（不顶穿路肩/路面），24→60m 渐入。
  *
  * ⚠ 为什么不照抄「|x|≤8 贴路面（y≈0）」：土路肩在 8.4→11.6 已按要求压低 0.35，
  *   若地面在 8→24 只从 0 降到 −0.4，土带外缘会在 x≈9.2 处没入草地 ⇒ 3.2m 土带只剩
@@ -44,19 +46,70 @@ const PROFILE: readonly (readonly [number, number])[] = [
 ];
 
 /**
- * 低频起伏包络（|x| → 振幅 m；列宽外的区间线性插值）。
- * 近场（≤60m）必须为 0（否则会顶穿路面/路肩）；120~420m 是可见的近丘；
- * 800/1400m 抬到 12~16m —— 1400m 列本身在 −40m，加起伏后仍全在路面之下，
- * 但能把「一刀切的地平线」变成起伏山脊（spec「远处雾过渡自然」的观感前提）。
+ * 低频起伏包络（|x| → 振幅 m；列宽外的区间平滑插值）。
+ * spec A2：中/远场滚动加大 —— 60m 起就有 0.8m 呼吸感，120~420m 抬到 4~10m
+ * （可见近丘），800/1400m 抬到 14/18m —— 1400m 列本身在 −40m，加起伏后仍全在
+ * 路面之下，但能把「一刀切的地平线」变成起伏山脊。
+ * ⚠ 铁律：|x|≤24m 起伏恒 0（不顶穿路肩/路面），24→60m 渐入 —— 在 `terrainPoint`
+ *   里用 smoothstep(24,60,|x|) 门控，`tableAt` 在 x≤60 会返回 0.8 只是「包络」，
+ *   真正生效的振幅还要乘门控（见下）。
  */
 const NOISE_AMP: readonly (readonly [number, number])[] = [
-  [60, 0],
-  [120, 2.6],
-  [220, 4.6],
-  [420, 6.0],
-  [800, 12],
-  [1400, 16]
+  [60, 0.8],
+  [120, 4.0],
+  [220, 7.5],
+  [420, 10],
+  [800, 14],
+  [1400, 18]
 ];
+
+/** 平滑阶跃：x 在 [edge0,edge1] 内 0→1，边缘外钳制（列间曲率连续） */
+function sstep(edge0: number, edge1: number, x: number): number {
+  const t = Math.min(1, Math.max(0, (x - edge0) / (edge1 - edge0)));
+  return t * t * (3 - 2 * t);
+}
+
+/* ── spec A1：地形大尺度色块（vertex colors）────────────────────────────
+ * 4 个基色（浅草/深草/橄榄/干土）按世界 (x,z) 低频噪声平滑混合，给高空俯瞰的
+ * 「纯绿地毯」加草甸/林斑/土斑节奏。噪声用多组异频正弦叠加（确定性，无随机表），
+ * 块尺度 ~150~300m（spec 120~260m 附近）；另加 `makeLcg` 每顶点 ±8% 亮度抖。
+ *
+ * ⚠ 关键：three 的 `map × vertexColor` 是相乘。若顶点色直接用基色（均值 ~0.4），
+ *   与绿色贴图（均值 ~0.38）相乘会把整片地面压成深绿泥潭（0.4×0.38≈0.15 线性）。
+ *   因此这里把混合色**归一化到 4 基色均值**（SPEC_MEAN）——顶点色成为「贴图均值
+ *   1.0 附近的调制」，整场亮度保住现状基线，同时保留基色间的**相对**块间对比
+ *   （浅草 ≈1.1×、深草 ≈0.7×、橄榄 ≈1.15×、干土 ≈0.9×）。渲染结果 = 绿贴图 ×
+ *   调制 ⇒ 有明暗/色相节奏的田野，非纯色地毯。
+ */
+const C_LIGHT_GRASS = new THREE.Color(0x6f7d4f);
+const C_DARK_GRASS = new THREE.Color(0x46523a);
+const C_OLIVE = new THREE.Color(0x7a7a4e);
+const C_DRY = new THREE.Color(0x6b5c40);
+/** 4 基色 RGB 均值（sRGB 0..1），顶点色归一化除此 */
+const SPEC_MEAN = new THREE.Color(
+  (0x6f + 0x46 + 0x7a + 0x6b) / 4 / 255,
+  (0x7d + 0x52 + 0x7a + 0x5c) / 4 / 255,
+  (0x4f + 0x3a + 0x4e + 0x40) / 4 / 255
+);
+
+const _vcA = new THREE.Color();
+const _vcB = new THREE.Color();
+/** 世界 (x,z) → 顶点色（调制系数，均值 ~1.0）；`rnd` 提供确定性 ±8% 亮度抖 */
+function sampleVertexColor(x: number, z: number, rnd: () => number, out: THREE.Color): THREE.Color {
+  // 双轴低频噪声（块尺度 ~150~300m）：n0 绿度（深草↔浅草）、n1 干度（橄榄↔干土）
+  const n0 = 0.5 + 0.5 * Math.sin(x * 0.031 + 1.3) * Math.sin(z * 0.029 + 2.7);
+  const n1 = 0.5 + 0.5 * Math.sin(x * 0.024 + 0.4) * Math.sin(z * 0.022 + 4.1);
+  const n2 = 0.5 + 0.5 * Math.sin(x * 0.047 + 5.9) * Math.sin(z * 0.045 + 1.1);
+  const dryMix = n2 * 0.55; // 干土/橄榄混入比例（多数为绿，偶见干斑）
+  _vcA.copy(C_DARK_GRASS).lerp(C_LIGHT_GRASS, n0);
+  _vcB.copy(C_OLIVE).lerp(C_DRY, n1);
+  out.copy(_vcA).lerp(_vcB, dryMix);
+  out.r /= SPEC_MEAN.r;
+  out.g /= SPEC_MEAN.g;
+  out.b /= SPEC_MEAN.b;
+  const j = 1 + (rnd() - 0.5) * 0.16; // ±8% 亮度抖
+  return out.multiplyScalar(j);
+}
 
 function tableAt(table: readonly (readonly [number, number])[], x: number): number {
   if (x <= table[0][0]) return table[0][1];
@@ -90,14 +143,21 @@ export function terrainPoint(s: number, lateral: number, out: THREE.Vector3): TH
   const ax = Math.abs(lateral);
   const bankFade = ax <= 24 ? 1 : Math.max(0, 1 - (ax - 24) / 36);
   const bankY = f.right.y * lateral * bankFade;
-  const amp = tableAt(NOISE_AMP, ax);
+  // 主低频起伏（包络 × 门控）：铁律 |x|≤24 恒 0，24→60m 平滑渐入（防顶穿路肩/路面）
+  const amp = tableAt(NOISE_AMP, ax) * sstep(24, 60, ax);
   const phase = lateral < 0 ? 2.1 : 0;
   const n1 = Math.sin((s / L) * TAU * 7 + 1.7);
   const n2 = Math.sin((s / L) * TAU * 23 + 0.4);
   const bumps = amp * (n1 * Math.cos(lateral * 0.004 + phase) * 0.6 + n2 * Math.sin(lateral * 0.006 + phase) * 0.4);
+  // 近中场地表高频小起伏（~35m 波长，±0.6m）：只作用于 |x|>40m，smoothstep(40,80) 渐入，
+  // 给 60~300m 近中场草甸「呼吸感」（spec A2）。波长 2π/0.18≈35m、2π/0.12≈52m。
+  const hfAmp = 0.6 * sstep(40, 80, ax);
+  const hf =
+    hfAmp *
+    (Math.sin(s * 0.18 + lateral * 0.09 + 1.2) * 0.7 + Math.sin(s * 0.12 + lateral * 0.15 + 4.4) * 0.3);
   out.set(
     f.center.x + rhx * lateral,
-    f.center.y + bankY + tableAt(PROFILE, ax) + bumps,
+    f.center.y + bankY + tableAt(PROFILE, ax) + bumps + hf,
     f.center.z + rhz * lateral
   );
   return out;
@@ -109,20 +169,37 @@ export function terrainY(s: number, lateral: number): number {
   return terrainPoint(s, lateral, SCRATCH).y;
 }
 
-/** 草地/泥土混合贴图（512²，偏灰绿，向旧 createSoilTexture 的颗粒尺度靠） */
+/** 草地/泥土混合贴图（1024²，偏灰绿；spec A1：升 1024、加大块低频色斑、UV 世界尺度 40m） */
 function grassTexture(): THREE.CanvasTexture {
-  const size = 512;
+  const size = 1024;
   const [canvas, ctx] = makeCanvas(size, size);
   ctx.fillStyle = '#5b6844';
   ctx.fillRect(0, 0, size, size);
   const rnd = makeLcg(20260832);
-  // 大块色斑：草地明暗 + 泥土斑
+  // 中尺度色斑：草地明暗（保留原颗粒性格，仅随画布升到 1024）
   for (let i = 0; i < 420; i++) {
     const g = Math.floor(84 + rnd() * 44);
     const r = g - Math.floor(6 + rnd() * 16);
     const b = g - Math.floor(20 + rnd() * 18);
     ctx.fillStyle = `rgba(${r},${g},${b},${(0.10 + rnd() * 0.22).toFixed(3)})`;
     const rad = 8 + rnd() * 46;
+    ctx.beginPath();
+    ctx.ellipse(rnd() * size, rnd() * size, rad, rad * (0.5 + rnd() * 0.7), rnd() * Math.PI, 0, Math.PI * 2);
+    ctx.fill();
+  }
+  // 大块低频色斑（spec A1：80~240px 椭圆，与 vertex color 同色系，alpha 0.15~0.3，~120 枚）
+  // 在 40m 世界尺度下 = 3~9m 的草甸/林斑/土斑块，给高空俯瞰的中尺度节奏。
+  const PATCH: readonly (readonly [number, number, number])[] = [
+    [0x6f, 0x7d, 0x4f], // 浅草
+    [0x46, 0x52, 0x3a], // 深草
+    [0x7a, 0x7a, 0x4e], // 橄榄
+    [0x6b, 0x5c, 0x40] // 干土
+  ];
+  for (let i = 0; i < 120; i++) {
+    const p = PATCH[Math.floor(rnd() * PATCH.length)];
+    const a = 0.15 + rnd() * 0.15;
+    ctx.fillStyle = `rgba(${p[0]},${p[1]},${p[2]},${a.toFixed(3)})`;
+    const rad = 40 + rnd() * 80; // 半径 40~120 ⇒ 直径 80~240px
     ctx.beginPath();
     ctx.ellipse(rnd() * size, rnd() * size, rad, rad * (0.5 + rnd() * 0.7), rnd() * Math.PI, 0, Math.PI * 2);
     ctx.fill();
@@ -166,8 +243,11 @@ export class Landscape {
     const cols = COLUMNS.length;
     const pos = new Float32Array(rings * cols * 3);
     const uv = new Float32Array(rings * cols * 2);
+    const col = new Float32Array(rings * cols * 3);
     const index: number[] = [];
     const tmp = new THREE.Vector3();
+    const vc = new THREE.Color();
+    const vRnd = makeLcg(0x5eecd1); // 顶点色确定性抖
 
     for (let i = 0; i < rings; i++) {
       const s = i * step;
@@ -178,9 +258,14 @@ export class Landscape {
         pos[o] = tmp.x;
         pos[o + 1] = tmp.y;
         pos[o + 2] = tmp.z;
+        // spec A1：顶点色按世界 (x,z) 低频噪声（大尺度色块）
+        sampleVertexColor(tmp.x, tmp.z, vRnd, vc);
+        col[o] = vc.r;
+        col[o + 1] = vc.g;
+        col[o + 2] = vc.b;
         const t = (i * cols + c) * 2;
-        uv[t] = tmp.x / 12;
-        uv[t + 1] = tmp.z / 12;
+        uv[t] = tmp.x / 40; // spec A1：UV 世界尺度 12m → 40m（大块色斑更连贯）
+        uv[t + 1] = tmp.z / 40;
       }
     }
 
@@ -197,6 +282,7 @@ export class Landscape {
     this.geometry = new THREE.BufferGeometry();
     this.geometry.setAttribute('position', new THREE.BufferAttribute(pos, 3));
     this.geometry.setAttribute('uv', new THREE.BufferAttribute(uv, 2));
+    this.geometry.setAttribute('color', new THREE.BufferAttribute(col, 3));
     this.geometry.setIndex(index);
     this.geometry.computeVertexNormals();
     this.geometry.computeBoundingSphere();
@@ -204,6 +290,7 @@ export class Landscape {
     this.texture = grassTexture();
     this.material = new THREE.MeshStandardMaterial({
       map: this.texture,
+      vertexColors: true, // spec A1：大尺度色块
       roughness: 0.95,
       metalness: 0.02
     });

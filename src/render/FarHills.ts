@@ -1,32 +1,43 @@
 /**
- * 远景地平线 · 远山环（1 个 mesh / 1 个材质 / 1 个 draw call）
+ * 远景地平线 · 远山环（spec A3：两圈 = 2 mesh / 2 draw call）
  *
  * 为什么需要：Landscape 的横向剖面只铺到 ±1400m，剖面高程在 1400m 处已降到 −40m，
  * 于是天空与地面的交界是一条**平滑一刀切**的地平线（D1 截图可辨）。本模块在
- * 地形之外补一圈低多边形山脊剪影，给地平线加一层「远山」层次。
+ * 地形之外补低多边形山脊剪影，给地平线加「远山」层次。
  *
- * 几何：闭合三角带（base 环 → 脊线环），角度分段 240（= 8~12 段可见山脊的
+ * spec A3：近环 H 60→80 / 140→200、色 0x9c9384 → 0x9a9a86（略偏绿，读作远森林）；
+ * 新增**第二圈外环**（radius ×1.4、高 100~150m、更浅色 0xa8a89b、`fog:true`）——
+ * 大气透视两层山脊，给地平线加深度。
+ *
+ * 几何（每圈）：闭合三角带（base 环 → 脊线环），角度分段 240（= 8~12 段可见山脊的
  * 低模感，但轮廓连续不锯齿）。每个角度：
- *   radius(θ) = max(spec 下限, 赛道在该方向的最远支撑距离) + 缓冲
- *   height(θ) = 60~140m（多个低频正弦叠加，确定性、无随机表）
+ *   radius(θ) = max(spec 下限, 赛道在该方向的最远支撑距离) + 缓冲，再 ×radiusScale
+ *   height(θ) = hMin..hMax（多个低频正弦叠加，确定性、无随机表）
  * 半径用**支撑函数**（赛道中心线在该方向上的最大投影）算，保证山脊环永远在
  * 赛道之外 —— 直接取「bbox 中心 + 2200~3200m」会在赛道最远端（离 bbox 中心
  * 约 4.0km）把山脊插进赛道中间，那是错的。
  *
- * 着色：`MeshBasicMaterial`（不受光，雾色 0x9c9384）+ `fog: true`（与 Environment
- * 的 FogExp2 同色，远景自动被雾吃掉一部分）；不投影、不接收阴影。
- * 尺寸/颜色口径来自 D2 任务书；不改 Renderer/Lighting/Environment 任何数值。
+ * 着色（每圈）：`MeshBasicMaterial`（不受光，雾同色）+ `fog: true`（与 Environment
+ * 的 FogExp2 同色，远景自动被雾吃掉一部分）；不投影、不接收阴影；`frustumCulled=false`。
+ * 尺寸/颜色口径来自 D2 任务书 + spec A3；不改 Renderer/Lighting/Environment 任何数值。
  */
 import * as THREE from 'three';
 import { getTrack } from '../track/nordschleife';
 
 /** 雾色（与 config/environment.ts 的 fog.color 同值，作为地平线剪影基色） */
-const HILL_COLOR = 0x9c9384;
-/** 角度分段（三角带 2 面/段 ⇒ 480 面，低模剪影足够平滑） */
+const HILL_COLOR_NEAR = 0x9a9a86;
+/** 外环更浅（大气透视更远一层） */
+const HILL_COLOR_OUTER = 0xa8a89b;
+/** 角度分段（三角带 2 面/段 ⇒ 480 面/圈，低模剪影足够平滑） */
 const SEGMENTS = 240;
-/** 山脊高度区间 m（任务书 60~140） */
-const H_MIN = 60;
-const H_MAX = 140;
+/** 近环山脊高度区间 m（spec A3：60→80 / 140→200） */
+const NEAR_H_MIN = 80;
+const NEAR_H_MAX = 200;
+/** 外环山脊高度区间 m（spec A3：100~150） */
+const OUTER_H_MIN = 100;
+const OUTER_H_MAX = 150;
+/** 外环半径倍数（spec A3：×1.4） */
+const OUTER_RADIUS_SCALE = 1.4;
 /** 赛道支撑距离之外再留的缓冲 m（保证环永远在赛道外侧） */
 const BUFFER = 900;
 /** 半径下限 m（任务书 2200~3200 的下沿；赛道不占的方向就按这个来） */
@@ -34,18 +45,22 @@ const R_MIN = 2200;
 /** 环底面相对赛道最低点再下沉 m（脊线以下全是实心「山体」，避免露底） */
 const BASE_DROP = 160;
 
-/** 确定性低频叠加（3 个互质周期，值域归一到 0..1） */
-function ridgeShape(theta: number): number {
-  const a = Math.sin(theta * 3 + 0.7);
-  const b = Math.sin(theta * 7 + 2.1);
-  const c = Math.sin(theta * 11 + 4.3);
+/** 确定性低频叠加（3 个互质周期，值域归一到 0..1）；`phase` 让外环与近环错峰（可见度） */
+function ridgeShape(theta: number, phase = 0): number {
+  const a = Math.sin(theta * 3 + 0.7 + phase);
+  const b = Math.sin(theta * 7 + 2.1 + phase);
+  const c = Math.sin(theta * 11 + 4.3 + phase);
   return Math.min(1, Math.max(0, 0.5 + (a * 0.5 + b * 0.3 + c * 0.2) * 0.5));
 }
 
+interface RingParts {
+  geometry: THREE.BufferGeometry;
+  material: THREE.MeshBasicMaterial;
+  mesh: THREE.Mesh;
+}
+
 export class FarHills {
-  private readonly geometry: THREE.BufferGeometry;
-  private readonly material: THREE.MeshBasicMaterial;
-  private readonly mesh: THREE.Mesh;
+  private readonly parts: RingParts[] = [];
 
   constructor(scene: THREE.Scene) {
     const track = getTrack();
@@ -62,6 +77,28 @@ export class FarHills {
       samples.push(track.center[i * 3] - cx, track.center[i * 3 + 2] - cz);
     }
 
+    // 近环：H 80~200、略偏绿（远森林）；外环：×1.4、H 100~150、更浅（大气透视）
+    // 外环相位错开（phase≈1.3），让外环在近环的「低谷」处露出脊峰 ⇒ 两层可见。
+    this.parts.push(this.buildRing(scene, samples, cx, cz, baseY, 1, NEAR_H_MIN, NEAR_H_MAX, HILL_COLOR_NEAR, 'far-hills', 0));
+    this.parts.push(
+      this.buildRing(scene, samples, cx, cz, baseY, OUTER_RADIUS_SCALE, OUTER_H_MIN, OUTER_H_MAX, HILL_COLOR_OUTER, 'far-hills-outer', 1.3)
+    );
+  }
+
+  /** 造一圈远山（base 环 → 脊线环），并挂到场景；返回部件供 dispose */
+  private buildRing(
+    scene: THREE.Scene,
+    samples: number[],
+    cx: number,
+    cz: number,
+    baseY: number,
+    radiusScale: number,
+    hMin: number,
+    hMax: number,
+    color: number,
+    name: string,
+    phase: number
+  ): RingParts {
     const count = SEGMENTS;
     const pos = new Float32Array(count * 2 * 3);
     const index: number[] = [];
@@ -75,8 +112,8 @@ export class FarHills {
         const p = samples[k] * dx + samples[k + 1] * dz;
         if (p > support) support = p;
       }
-      const radius = Math.max(R_MIN, support + BUFFER);
-      const height = H_MIN + (H_MAX - H_MIN) * ridgeShape(th);
+      const radius = Math.max(R_MIN, support + BUFFER) * radiusScale;
+      const height = hMin + (hMax - hMin) * ridgeShape(th, phase);
       const o = i * 6;
       // 底环
       pos[o] = cx + dx * radius;
@@ -96,31 +133,34 @@ export class FarHills {
       index.push(a, b2, c, c, b2, d);
     }
 
-    this.geometry = new THREE.BufferGeometry();
-    this.geometry.setAttribute('position', new THREE.BufferAttribute(pos, 3));
-    this.geometry.setIndex(index);
+    const geometry = new THREE.BufferGeometry();
+    geometry.setAttribute('position', new THREE.BufferAttribute(pos, 3));
+    geometry.setIndex(index);
     // MeshBasicMaterial 不用法线 ⇒ 不算法线（省一次 480 顶点的遍历）
-    this.geometry.computeBoundingSphere();
+    geometry.computeBoundingSphere();
 
-    this.material = new THREE.MeshBasicMaterial({
-      color: HILL_COLOR,
+    const material = new THREE.MeshBasicMaterial({
+      color,
       side: THREE.DoubleSide,
       fog: true
     });
 
-    this.mesh = new THREE.Mesh(this.geometry, this.material);
-    this.mesh.name = 'far-hills';
-    this.mesh.castShadow = false;
-    this.mesh.receiveShadow = false;
-    this.mesh.frustumCulled = false; // 环包住整个场景，包围球判可见性只会白算
-    this.mesh.matrixAutoUpdate = false;
-    this.mesh.updateMatrix();
-    scene.add(this.mesh);
+    const mesh = new THREE.Mesh(geometry, material);
+    mesh.name = name;
+    mesh.castShadow = false;
+    mesh.receiveShadow = false;
+    mesh.frustumCulled = false; // 环包住整个场景，包围球判可见性只会白算
+    mesh.matrixAutoUpdate = false;
+    mesh.updateMatrix();
+    scene.add(mesh);
+    return { geometry, material, mesh };
   }
 
   dispose(): void {
-    this.mesh.removeFromParent();
-    this.geometry.dispose();
-    this.material.dispose();
+    for (const p of this.parts) {
+      p.mesh.removeFromParent();
+      p.geometry.dispose();
+      p.material.dispose();
+    }
   }
 }
