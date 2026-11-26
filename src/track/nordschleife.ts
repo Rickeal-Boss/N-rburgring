@@ -15,6 +15,8 @@
  * 本文件只提供几何，不做任何渲染/物理；所有采样数组在构造时一次算好。
  */
 
+import { newSuedschleife } from './suedschleife';
+
 export interface V3 {
   x: number;
   y: number;
@@ -40,6 +42,10 @@ export interface TrackFrame {
 }
 
 export const TRACK_LENGTH = 20831.6;
+
+/** 高程剖面：按弧长 s（米）与总长 L（米）返回世界 y 高程（米） */
+export type ElevationProfile = (s: number, L: number) => number;
+
 /** 世界尺度下路点（米）；x 已含东西向压缩，整体按 TRACK_LENGTH 归一 */
 export const WAYPOINTS: ReadonlyArray<readonly [number, number]> = [
   [-26.23, 145.71], [-78.68, 291.41], [-52.45, 437.12], [-118.02, 564.61], [-65.57, 710.32],
@@ -211,11 +217,15 @@ export class Nordschleife {
     bank: 0
   };
 
-  constructor() {
-    const dense = catmullRomClosed(WAYPOINTS, 24);
+  constructor(
+    waypoints: ReadonlyArray<readonly [number, number]> = WAYPOINTS,
+    targetLength: number = TRACK_LENGTH,
+    elevation: ElevationProfile = elevationRaw
+  ) {
+    const dense = catmullRomClosed(waypoints, 24);
     const raw = resampleClosed2D(dense, 6000);
-    const scaled = normalizeLength(raw.points, raw.length, TRACK_LENGTH);
-    const count = Math.max(256, Math.round(TRACK_LENGTH / ROAD.sampleSpacing));
+    const scaled = normalizeLength(raw.points, raw.length, targetLength);
+    const count = Math.max(256, Math.round(targetLength / ROAD.sampleSpacing));
     const { points, length } = resampleClosed2D(scaled, count);
     this.count = count;
     this.length = length;
@@ -228,7 +238,7 @@ export class Nordschleife {
     for (let i = 0; i < count; i++) {
       cx[i] = points[i].x;
       cz[i] = points[i].z;
-      cy[i] = elevationRaw((i * this.length) / count, this.length);
+      cy[i] = elevation((i * this.length) / count, this.length);
     }
 
     // 第二遍：3D 切向（含坡度）、右向、上向
@@ -525,17 +535,89 @@ export class Nordschleife {
   }
 }
 
-let singleton: Nordschleife | null = null;
+/** 赛道模式：北环（默认）或南环（Südschleife） */
+export type TrackMode = 'nordschleife' | 'suedschleife';
 
-/** 全局单例（装配层只取一次，禁止各处 new） */
-export function getTrack(): Nordschleife {
-  if (!singleton) singleton = new Nordschleife();
-  return singleton;
+let currentMode: TrackMode = 'nordschleife';
+const cache: Partial<Record<TrackMode, Nordschleife>> = {};
+
+function buildTrack(mode: TrackMode): Nordschleife {
+  return mode === 'suedschleife' ? newSuedschleife() : new Nordschleife();
 }
 
-/** 供测试/工具重置 */
+/** 取指定模式的赛道（惰性构建，双轨独立缓存） */
+export function getTrackFor(mode: TrackMode): Nordschleife {
+  let t = cache[mode];
+  if (!t) {
+    t = buildTrack(mode);
+    cache[mode] = t;
+  }
+  return t;
+}
+
+/** 全局当前赛道（装配层只取一次，禁止各处 new）。保持无参、返回类型不变。 */
+export function getTrack(): Nordschleife {
+  return getTrackFor(currentMode);
+}
+
+/** 切换当前激活赛道模式（运行期消费方零改动） */
+export function setTrackMode(mode: TrackMode): void {
+  currentMode = mode;
+}
+
+/** 当前激活赛道模式（供 apex 选择等按模式参数化的消费方） */
+export function getCurrentMode(): TrackMode {
+  return currentMode;
+}
+
+/** 弯道 apex 选择结果：s=弧长、c=带符号曲率（>0 左弯 / <0 右弯；排序与阈值按 |c|） */
+export interface ApexPick {
+  s: number;
+  c: number;
+}
+
+/** apex 选择常量（全弯道设施同源：观众/喷绘/apex板/刹车痕/砾石带/横幅/轮胎墙/岗亭/制动牌） */
+const APEX_GAP = 700;
+const APEX_MAX = 8;
+const APEX_STEP = 10;
+const APEX_MARGIN = 300;
+/** 按模式参数化阈值：北环 0.006（曲率半径 <167m 急弯，自然得 6 个）；
+ *  南环 curvature 序列更缓，0.006 只选到 4 个 ⇒ 放宽 0.0025 补满 6 个（密度与北环看齐）。
+ *  ⚠ 勿全局降低（会扰动北环既有设施布局），必须按模式分流（V36 满铺口径）。 */
+const APEX_THRESH: Record<TrackMode, number> = {
+  nordschleife: 0.006,
+  suedschleife: 0.0025
+};
+
+/**
+ * 弯道 apex 选择（全设施同源唯一入口）：沿 s∈[300, L−300] 步长 10m 收集 |curv|>thresh
+ * 候选 {s, c}，按 |c| 降序取前 8、且与已选 apex 间距 >700m。返回带符号 c（供内外侧判断）。
+ *  V36 起按赛道模式参数化（北环 0.006 / 南环 0.0025），保证北环集合逐点不变、南环补满密度。
+ */
+export function selectApexes(mode: TrackMode): ApexPick[] {
+  const tr = getTrackFor(mode);
+  const L = tr.length;
+  const thresh = APEX_THRESH[mode];
+  const cand: ApexPick[] = [];
+  for (let s = APEX_MARGIN; s < L - APEX_MARGIN; s += APEX_STEP) {
+    const f = tr.at(s);
+    const c = f.curvature;
+    if (Math.abs(c) > thresh) cand.push({ s, c });
+  }
+  cand.sort((a, b) => Math.abs(b.c) - Math.abs(a.c));
+  const apexes: ApexPick[] = [];
+  for (const p of cand) {
+    if (apexes.length >= APEX_MAX) break;
+    if (apexes.every((v) => Math.abs(v.s - p.s) > APEX_GAP)) apexes.push(p);
+  }
+  return apexes;
+}
+
+/** 供测试/工具重置：清双轨缓存并复位模式 */
 export function resetTrack(): void {
-  singleton = null;
+  delete cache.nordschleife;
+  delete cache.suedschleife;
+  currentMode = 'nordschleife';
 }
 
 /** 未使用的上向常量占位（保持树摇） */

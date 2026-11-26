@@ -92,6 +92,20 @@ const SPEC_MEAN = new THREE.Color(
   (0x4f + 0x3a + 0x4e + 0x40) / 4 / 255
 );
 
+/**
+ * V2 第 5 基色：苔藓/岩屑点缀色（更细色斑层次）。低权重混入，4 基色低频混结构不变，
+ * 只给 150~300m 大色块之间加一层 ~50~90m 的细斑节奏。
+ */
+const C_MOSS = new THREE.Color(0x5a6b4a);
+/** V2 岩壁/碎石色（陡坡露岩；归一化后是亮暖灰「碎石」调制） */
+const C_ROCK = new THREE.Color(0x8f867c);
+/** V2 近路鲜草（路肩外 8..24m 更鲜更密；归一化后偏亮饱和绿） */
+const C_FRESH = new THREE.Color(0x5f7f3a);
+/** 岩/鲜草色归一化到 4 基色均值（与基色同一调制空间，保证平均亮度仍在 ~1.0 附近）。
+ *  ⚠ 逐通道手除（THREE.Color 无 divide，用 r/g/b 分量比）。 */
+const ROCK_NORM = new THREE.Color(C_ROCK.r / SPEC_MEAN.r, C_ROCK.g / SPEC_MEAN.g, C_ROCK.b / SPEC_MEAN.b);
+const FRESH_NORM = new THREE.Color(C_FRESH.r / SPEC_MEAN.r, C_FRESH.g / SPEC_MEAN.g, C_FRESH.b / SPEC_MEAN.b);
+
 const _vcA = new THREE.Color();
 const _vcB = new THREE.Color();
 /** 世界 (x,z) → 顶点色（调制系数，均值 ~1.0）；`rnd` 提供确定性 ±8% 亮度抖 */
@@ -101,9 +115,13 @@ function sampleVertexColor(x: number, z: number, rnd: () => number, out: THREE.C
   const n1 = 0.5 + 0.5 * Math.sin(x * 0.024 + 0.4) * Math.sin(z * 0.022 + 4.1);
   const n2 = 0.5 + 0.5 * Math.sin(x * 0.047 + 5.9) * Math.sin(z * 0.045 + 1.1);
   const dryMix = n2 * 0.55; // 干土/橄榄混入比例（多数为绿，偶见干斑）
+  // V2 第 5 基色层次：更高频双轴噪声（块尺度 ~50~90m）按低权重混入苔藓/岩屑色，
+  // 给大色块之间加一层更细的节奏 —— 只加层次，4 基色低频混 + 亮度抖结构不变。
+  const n3 = 0.5 + 0.5 * Math.sin(x * 0.061 + 3.4) * Math.sin(z * 0.057 + 0.9);
   _vcA.copy(C_DARK_GRASS).lerp(C_LIGHT_GRASS, n0);
   _vcB.copy(C_OLIVE).lerp(C_DRY, n1);
   out.copy(_vcA).lerp(_vcB, dryMix);
+  out.lerp(C_MOSS, n3 * 0.2);
   out.r /= SPEC_MEAN.r;
   out.g /= SPEC_MEAN.g;
   out.b /= SPEC_MEAN.b;
@@ -214,6 +232,18 @@ function grassTexture(): THREE.CanvasTexture {
     ctx.ellipse(rnd() * size, rnd() * size, rad, rad * (0.5 + rnd() * 0.6), rnd() * Math.PI, 0, Math.PI * 2);
     ctx.fill();
   }
+  // V2 更细色斑层次：小尺度苔藓/岩屑点缀（第 5 基色系），给近地草面再加一层细碎节奏
+  // （40m 世界尺度下 6~28px = 0.23~1.1m，8m 内可读的「绿地狱」细斑）。一次性烘焙，零逐帧成本。
+  for (let i = 0; i < 220; i++) {
+    const g = Math.floor(78 + rnd() * 30);
+    const r = g - Math.floor(4 + rnd() * 10);
+    const b = g - Math.floor(24 + rnd() * 20);
+    ctx.fillStyle = `rgba(${r},${g},${b},${(0.05 + rnd() * 0.1).toFixed(3)})`;
+    const rad = 3 + rnd() * 14;
+    ctx.beginPath();
+    ctx.ellipse(rnd() * size, rnd() * size, rad, rad * (0.5 + rnd() * 0.7), rnd() * Math.PI, 0, Math.PI * 2);
+    ctx.fill();
+  }
   // 细颗粒（8m 尺度可读）
   for (let i = 0; i < 9000; i++) {
     const g = Math.floor(72 + rnd() * 78);
@@ -249,23 +279,64 @@ export class Landscape {
     const vc = new THREE.Color();
     const vRnd = makeLcg(0x5eecd1); // 顶点色确定性抖
 
+    // 世界坐标缓存（第二遍算坡度用，避免重复 terrainPoint）
+    const wx = new Float32Array(rings * cols);
+    const wz = new Float32Array(rings * cols);
+    // Pass 1：位置 + UV（spec A1：UV 世界尺度 40m，大块色斑更连贯）
     for (let i = 0; i < rings; i++) {
       const s = i * step;
       for (let c = 0; c < cols; c++) {
         const x = COLUMNS[c];
         terrainPoint(s, x, tmp);
-        const o = (i * cols + c) * 3;
+        const idx = i * cols + c;
+        const o = idx * 3;
         pos[o] = tmp.x;
         pos[o + 1] = tmp.y;
         pos[o + 2] = tmp.z;
-        // spec A1：顶点色按世界 (x,z) 低频噪声（大尺度色块）
-        sampleVertexColor(tmp.x, tmp.z, vRnd, vc);
+        wx[idx] = tmp.x;
+        wz[idx] = tmp.z;
+        const t = idx * 2;
+        uv[t] = tmp.x / 40;
+        uv[t + 1] = tmp.z / 40;
+      }
+    }
+    // Pass 2：顶点色 = 4 基色低频混 + 第 5 基色细斑 + 亮度抖（sampleVertexColor），
+    // 再叠加 V2 两层颜色层次：陡坡露岩（岩壁/碎石带）+ 近路鲜草过渡带。
+    // ⚠ 只改颜色，不动高程（|x|≤24 起伏恒 0 / 横倾跟随逻辑完全不受影响）。
+    for (let i = 0; i < rings; i++) {
+      for (let c = 0; c < cols; c++) {
+        const idx = i * cols + c;
+        const ax = Math.abs(COLUMNS[c]);
+        sampleVertexColor(wx[idx], wz[idx], vRnd, vc);
+        // 局部坡度：取横向邻点 (c-1) 与纵向邻点 (i-1) 的最大高差/水平距比
+        let slope = 0;
+        if (c > 0) {
+          const dx = wx[idx] - wx[idx - 1];
+          const dz = wz[idx] - wz[idx - 1];
+          const dh = Math.hypot(dx, dz);
+          slope = Math.max(slope, Math.abs(pos[idx * 3 + 1] - pos[(idx - 1) * 3 + 1]) / Math.max(0.5, dh));
+        }
+        if (i > 0) {
+          const dx = wx[idx] - wx[idx - cols];
+          const dz = wz[idx] - wz[idx - cols];
+          const dh = Math.hypot(dx, dz);
+          slope = Math.max(slope, Math.abs(pos[idx * 3 + 1] - pos[(idx - cols) * 3 + 1]) / Math.max(0.5, dh));
+        }
+        // V2 岩壁/碎石：陡坡（>10% 坡开始露岩，~22% 全露）。×sstep(24,60,|x|) 门控保证
+        // |x|≤24 完全无岩（路肩/路面不受影响）；×rockPatch（~75m 斑块噪声）把整面岩板
+        // 打散成「露头」而不是连续岩墙 —— 读作绿地狱里的岩壁/碎石带。
+        // V3：混入权重 0.85 → 0.80（微收敛，防整面岩板读作过亮的亮暖灰，不推翻 V2 结构）。
+        const rockPatch = 0.55 + 0.45 * Math.sin(wx[idx] * 0.083 + 2.2) * Math.sin(wz[idx] * 0.077 + 5.5);
+        const rockMix = sstep(0.1, 0.22, slope) * sstep(24, 60, ax) * rockPatch * 0.8;
+        if (rockMix > 0) vc.lerp(ROCK_NORM, rockMix);
+        // V2 近路鲜草：路肩外 8..24m 草色更鲜更密（只调色），24→60m 渐隐回常态。
+        // V3：权重 0.55 → 0.50（微收敛，防鲜草带读作过饱和的亮绿，路肩/路面不受影响）。
+        const freshMix = sstep(6, 12, ax) * (1 - sstep(24, 40, ax));
+        if (freshMix > 0) vc.lerp(FRESH_NORM, freshMix * 0.5);
+        const o = idx * 3;
         col[o] = vc.r;
         col[o + 1] = vc.g;
         col[o + 2] = vc.b;
-        const t = (i * cols + c) * 2;
-        uv[t] = tmp.x / 40; // spec A1：UV 世界尺度 12m → 40m（大块色斑更连贯）
-        uv[t + 1] = tmp.z / 40;
       }
     }
 

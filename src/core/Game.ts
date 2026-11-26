@@ -43,7 +43,7 @@ import { Landmarks } from '../render/Landmarks';
 import { Landscape } from '../render/Landscape';
 import { Scenery } from '../render/Scenery';
 import { Track } from '../render/Track';
-import { getTrack } from '../track/nordschleife';
+import { getTrack, setTrackMode, type TrackMode } from '../track/nordschleife';
 import { clamp, lerp } from '../util/math';
 import { Hud } from '../ui/Hud';
 import { Menu } from '../ui/Menu';
@@ -77,6 +77,11 @@ const EMPTY_LAP_STATE: LapState = {
   deltaMs: null
 };
 
+/** 圈速存储 key 按赛道分轨（北环 / 南环互不污染；沿用 nr.bestLap 命名空间） */
+function bestLapKey(mode: TrackMode): string {
+  return mode === 'suedschleife' ? 'nr.bestLap.suedschleife' : 'nr.bestLap.nordschleife';
+}
+
 export class Game {
   private readonly scene = new THREE.Scene();
   private readonly renderer: THREE.WebGLRenderer;
@@ -85,12 +90,13 @@ export class Game {
   private readonly env: Environment;
   private readonly lighting: Lighting;
   private readonly contactShadow: ContactShadow;
-  private readonly trackScene: Track;
-  private readonly landscape: Landscape;
-  private readonly farHills: FarHills;
-  private readonly scenery: Scenery;
-  /** D3：程序化白石城堡地标（大门 ×2 / 塔群 ×3 / 主殿 ×1） */
-  private readonly landmarks: Landmarks;
+  /** 赛道场景组件（换赛道时 dispose + 重建，故非 readonly） */
+  private trackScene: Track;
+  private landscape: Landscape;
+  private farHills: FarHills;
+  private scenery: Scenery;
+  /** D3：程序化白石城堡地标（北环 大门×2/塔群×3/主殿×1；南环 大门×2/塔群×2/主殿×1） */
+  private landmarks: Landmarks;
   private readonly car: CarLike;
   private readonly profile = getVehicleProfile(resolveVehicleId());
   private readonly tier: QualitySettings['tier'];
@@ -101,7 +107,10 @@ export class Game {
   private readonly loop: Loop;
   private readonly qualityGovernor: AdaptiveQuality;
   private readonly drive = new Drive();
-  private readonly lap = new LapTimer(getTrack());
+  /** 当前赛道模式（北环默认；换赛道时经 selectTrack 重设，与 nordschleife.currentMode 同步） */
+  private mode: TrackMode = 'nordschleife';
+  /** 圈速计时（换赛道时重设，key 按赛道分轨，互不污染） */
+  private lap: LapTimer;
 
   /** 复用载荷（零每帧分配） */
   private readonly fxInput: FxFrameInput = {
@@ -143,6 +152,10 @@ export class Game {
   private readonly autoStart = window.location.hash.includes('autostart');
   /** QA：`#autodrive` 自动驾驶跑圈（生产构建同样可用，默认零开销） */
   private readonly autoDrive = window.location.hash.includes('autodrive');
+  /** QA：`#track=<mode>` 直达指定赛道（nordschleife 默认 / suedschleife）；在场景组件构建前设好激活模式 */
+  private readonly trackHash = /[#&]track=(nordschleife|suedschleife)/.exec(window.location.hash)?.[1] as
+    | TrackMode
+    | undefined;
   private readonly viewHash = /[#&]view=([a-zA-Z]+)/.exec(window.location.hash)?.[1] as CameraMode | undefined;
   private readonly topCam = /[#&]topcam=([\d.]+),([\d.]+)/.exec(window.location.hash);
   /** QA：`#s=<米>` 直接把车放到指定弧长（截图/分段目检用） */
@@ -162,8 +175,15 @@ export class Game {
 
   constructor(container: HTMLElement, quality: QualitySettings, onFirstFrame: () => void) {
     this.onReadyCallback = onFirstFrame;
+    // QA `#track=<mode>`：在场景组件构建前设好激活模式（getTrack() 自此返回对应赛道）
+    this.mode = this.trackHash ?? 'nordschleife';
+    setTrackMode(this.mode);
+    // Hud 是字段初始化器（早于本构造体、按默认北环建图）⇒ 按实际模式重算小地图/标签
+    this.hud.setTrack(this.mode);
     this.renderer = createRenderer(container, quality);
     this.tier = quality.tier;
+    // 圈速计时（key 按赛道分轨：北环 / 南环互不污染）
+    this.lap = new LapTimer(getTrack(), bestLapKey(this.mode));
     this.qualityGovernor = new AdaptiveQuality(quality);
     this.rig = new CameraRig(window.innerWidth / window.innerHeight);
     this.env = new Environment(this.scene, this.renderer, quality.envMapSize);
@@ -175,8 +195,8 @@ export class Game {
     this.landscape = new Landscape(this.scene);
     this.farHills = new FarHills(this.scene);
     this.scenery = new Scenery(this.scene);
-    // D3 地标：低质量档连近景大门也降装饰密度（几何尺寸不变）
-    this.landmarks = new Landmarks(this.scene, this.tier === 'low');
+    // D3 地标：低质量档连近景大门也降装饰密度（几何尺寸不变）；按赛道模式选地标表
+    this.landmarks = new Landmarks(this.scene, this.tier === 'low', this.mode);
 
     // 车（只保留 V800：外部壳异步挂载，加载屏由 pollLoadGate 控制）
     this.car = createV800CarAdapter(this.tier, resolveAssemblyPaintId(this.profile.id) ?? undefined);
@@ -196,12 +216,16 @@ export class Game {
     this.drive.onImpact = (strength, x, y, z) => this.onImpact(strength, x, y, z);
     this.drive.onBodyPose = (roll, pitch) => this.car.applyWheelSuspension?.(roll, pitch);
 
-    this.menu = new Menu({
-      onStart: () => this.startRun(),
-      onResume: () => this.resume(),
-      onRestart: () => this.restartFromLine(),
-      onToggleMute: () => this.toggleMute()
-    });
+    this.menu = new Menu(
+      {
+        onStart: () => this.startRun(),
+        onResume: () => this.resume(),
+        onRestart: () => this.restartFromLine(),
+        onToggleMute: () => this.toggleMute(),
+        onSelectTrack: (mode) => this.selectTrack(mode)
+      },
+      this.mode
+    );
     this.hud.setVisible(false);
     this.menu.showStart(this.lap.best);
     this.rig.setMode('orbit');
@@ -298,6 +322,58 @@ export class Game {
     this.beginCountdown();
   }
 
+  /**
+   * 切换赛道（首屏选择器 / QA `#track=` 运行时路径）。
+   *
+   * 只在**菜单相位**由选择器触发；若恰在驾驶/暂停/倒计时中调用则先回菜单
+   * （换赛道作废当前圈时，用户重新「开始驾驶」）。
+   *
+   * 流程：① 回菜单 → ② dispose 场景组件 → ③ setTrackMode → ④ 重建（Landmarks 传 mode）→
+   * ⑤ 车复位 → ⑥ 重设圈速计时（新 key）→ ⑦ HUD 小地图重算 → ⑧ GPU 预热（新 bounds）→ ⑨ 刷新。
+   * Drive/AutoPilot 走 getTrack() 无参自动跟随当前赛道，本方法零改动它们。
+   */
+  private selectTrack(mode: TrackMode): void {
+    if (mode === this.mode) return;
+    const wasActive = this.phase !== 'menu';
+    // ① 若在驾驶中：回菜单（清输入/作废当前圈）
+    if (wasActive) {
+      this.phase = 'menu';
+      this.clearInput();
+    }
+    // ② dispose 场景组件（全部带 dispose，逐组释放 geometry/material/texture）
+    this.landmarks.dispose();
+    this.scenery.dispose();
+    this.farHills.dispose();
+    this.landscape.dispose();
+    this.trackScene.dispose();
+    // ③ 切赛道（getTrack() 自此返回新赛道）
+    setTrackMode(mode);
+    this.mode = mode;
+    // ④ 重建场景组件（Landmarks 传 mode；其余按 getTrack() 内部取当前赛道）
+    this.trackScene = new Track(this.scene, this.renderer.capabilities.getMaxAnisotropy());
+    this.landscape = new Landscape(this.scene);
+    this.farHills = new FarHills(this.scene);
+    this.scenery = new Scenery(this.scene);
+    this.landmarks = new Landmarks(this.scene, this.tier === 'low', mode);
+    // ⑤ 车复位到新赛道起点
+    this.drive.resetToStart();
+    // ⑥ 重设圈速计时（新赛道 key，互不污染）
+    this.lap = new LapTimer(getTrack(), bestLapKey(mode));
+    this.lapView = EMPTY_LAP_STATE;
+    this.lapViewAt = -1;
+    // ⑦ HUD 小地图重算（新 bounds / 中心线 / 起终线）+ 回菜单隐藏 HUD
+    this.hud.setTrack(mode);
+    this.hud.setVisible(false);
+    // ⑧ GPU 预热（新 bounds）
+    this.prewarm();
+    // ⑨ 刷新：位姿吸附 + 特效清空 + 菜单高亮/文案 + 回菜单
+    this.snapPrevPose();
+    this.fx.clear();
+    this.menu.setTrack(mode);
+    this.menu.showStart(this.lap.best);
+    if (wasActive) this.rig.setMode('orbit');
+  }
+
   private toggleMute(): boolean {
     const muted = this.sfx.setMuted(!this.sfx.isMuted);
     if (!muted) this.sfx.uiClick();
@@ -349,8 +425,10 @@ export class Game {
     const k = this.keys;
     this.input.throttle = k.has('KeyW') || k.has('ArrowUp') ? 1 : 0;
     this.input.brake = k.has('KeyS') || k.has('ArrowDown') ? 1 : 0;
+    // steer>0 ⇒ yawRate>0 ⇒ 车头转向 +X；模型局部 +X = 车右侧 ⇒ steer>0 = 右转。
+    // 故 A=左(D)、D=右(A) 的语义需要：A → steer=-1，D → steer=+1。
     this.input.steer =
-      (k.has('KeyA') || k.has('ArrowLeft') ? 1 : 0) - (k.has('KeyD') || k.has('ArrowRight') ? 1 : 0);
+      (k.has('KeyD') || k.has('ArrowRight') ? 1 : 0) - (k.has('KeyA') || k.has('ArrowLeft') ? 1 : 0);
     this.input.handbrake = k.has('Space');
   }
 
@@ -469,7 +547,7 @@ export class Game {
       this.lapViewAt = this.time;
       this.lapView = this.lap.state();
     }
-    this.hud.update(this.lapView, tele.speedKmh, tele.s, st.heading, tele.gear);
+    this.hud.update(this.lapView, tele.speedKmh, tele.s, st.heading, tele.gear, tele.cornerHint);
 
     // ---- 渲染 ----
     this.postfx.render();

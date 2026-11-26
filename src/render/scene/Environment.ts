@@ -99,6 +99,13 @@ const SKY_COLOR_GLSL = /* glsl */ `
       float t2 = smoothstep(0.12, 0.65, h);
       col = mix(horizonCol, uMid, t1);
       col = mix(col, uZenith, t2);
+      // V2 大气散射增强（只加层次，不动既有渐变/暖晕结构）：
+      // ① 地平线雾霭 —— 低仰角（h<0.08）向雾色收一条柔和「空气透视」带，远山/地形
+      //    在地平线处读作雾霭而不是硬切（GLSL smoothstep 需 edge0<edge1，用 1−smoothstep 反向）。
+      col = mix(col, uFogColor, (1.0 - smoothstep(0.0, 0.08, h)) * 0.18);
+      // ② 天顶渐变分层 —— 0.55→0.95 再向 uZenith 收一层，让「中段→天顶」从一段线性渐变
+      //    变成两段式（近地平线转冷快、近天顶转深慢），读出天顶深度。
+      col = mix(col, uZenith, smoothstep(0.55, 0.95, h) * 0.12);
     } else {
       col = mix(horizonCol, uGround, smoothstep(0.0, 0.08, -h));
       // R43-P0B/P4（保险丝）：深俯角（h < −0.35）把 uGround 拉向雾色 ——
@@ -148,7 +155,9 @@ const SKY_COLOR_GLSL = /* glsl */ `
       // 两层会读成「一整块有纹理的灰板」。
       float macro = fbm(uv * 0.5 + vec2(8.2, -4.1));
       // 两层不同尺度相乘 = 「厚云顶 + 薄云尾」；macro 做密度分区（0.72~1.28 倍）
-      float cover = smoothstep(0.44, 0.80, base) * (0.72 + (detail - 0.5) * 0.55) * (0.72 + macro * 0.56);
+      // V3 边缘软化：smoothstep(0.44,0.80) → (0.42,0.84)，下沿降 0.02 / 上沿抬 0.04，
+      //   薄云覆盖的过渡带更宽 ⇒ 云缘羽化而非硬边；重云 0.85 下仍读得出层理（不糊）。
+      float cover = smoothstep(0.42, 0.84, base) * (0.72 + (detail - 0.5) * 0.55) * (0.72 + macro * 0.56);
       float vertical = smoothstep(0.015, 0.15, h) * (1.0 - smoothstep(0.28, 0.9, h));
       float c = clamp(cover * uCloudAmount * vertical, 0.0, 0.94);
       // 亮边 / 暗底两段映射（不是单一 mix）：
@@ -158,9 +167,13 @@ const SKY_COLOR_GLSL = /* glsl */ `
       //    往上迅速转冷蓝灰」—— 旧代码让亮云延伸到 h≈0.9，高空机位（aerial）
       //    整片天读到 L≈160 暖白（像素探针实测），与参考图的阴沉冷天光相反。
       //    3.4° 以下满亮、17° 以上全暗，与 glow 的 bandWeight 同一思想。
+      // V3 云体厚度/明暗层次：cover 越高 = 云体越厚 → 云底越暗（thickness 压向
+      //   uCloudDark，+0.38 封顶），薄云边缘（cover 低）保留逆光亮缘 ⇒ 读作
+      //   「厚云顶暗、薄云缘亮」的立体云团，而非一整块灰板。
       float cloudBand = 1.0 - smoothstep(0.06, 0.30, abs(h));
       vec3 cloudNear = mix(uCloudLit, uSunColor * 1.12, (pow(sd, 2.0) * 0.85 + 0.15) * cloudBand);
-      vec3 cloud = mix(cloudNear, uCloudDark, smoothstep(0.34, 0.86, detail));
+      float thickness = smoothstep(0.5, 0.95, cover);
+      vec3 cloud = mix(cloudNear, uCloudDark, clamp(smoothstep(0.34, 0.86, detail) + thickness * 0.38, 0.0, 1.0));
       col = mix(col, cloud, c);
     }
     return col;
@@ -233,10 +246,12 @@ function skyUniforms(sunDir: THREE.Vector3, preset: EnvPreset): Record<string, T
     .clone()
     .lerp(new THREE.Color(preset.sky.horizon), 0.3)
     .multiplyScalar(0.26);
+  // V3：cloudDark ×0.20 → ×0.18（云底再深 10%）—— 配合 shader 的 `thickness` 压暗，
+  // 增强「厚云顶暗、薄云缘亮」的明暗层次；仍由 mid/ground 派生，不硬编码色相。
   const cloudDark = mid
     .clone()
     .lerp(new THREE.Color(preset.sky.ground), 0.55)
-    .multiplyScalar(0.2);
+    .multiplyScalar(0.18);
   return {
     uSunDir: { value: sunDir.clone() },
     uZenith: { value: new THREE.Color(preset.sky.zenith) },

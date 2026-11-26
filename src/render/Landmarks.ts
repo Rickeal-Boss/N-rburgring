@@ -48,7 +48,7 @@
  * **以 `landmark.meshes` 的读数为唯一口径。**
  */
 import * as THREE from 'three';
-import { getTrack } from '../track/nordschleife';
+import { getTrack, type TrackMode } from '../track/nordschleife';
 import { mergeSafe } from '../util/geo';
 import { terrainPoint } from './Landscape';
 import { createAshlarTexture } from './scene/ashlarTexture';
@@ -144,7 +144,7 @@ export interface Placement {
  * 否则 210m 立面只能侧着看、正门大拱门读不出来；转 90° 后立面沿赛道铺开
  * （沿 s 跨 ±105m）、横向只占「前脸凸出 37m / 后身 77m」⇒ 实测内缘 112.9m，远离路面。
  */
-const PLACEMENTS: readonly Placement[] = [
+const NORDSCHLEIFE_PLACEMENTS: readonly Placement[] = [
   // ── 大门 ×2（近景，跨路，高配 + castShadow）
   { kind: 'gate', s: 2400, lateral: 0, scale: 1, yaw: 0, sink: -0.9, castShadow: true },
   { kind: 'gate', s: 13200, lateral: 0, scale: 1, yaw: 0, sink: -0.9, castShadow: true },
@@ -162,6 +162,47 @@ const PLACEMENTS: readonly Placement[] = [
   // 触地，后排远处残余悬空 ≤0.3m（后段是 30m 低排，藏在高 96m 前脸之后）。
   { kind: 'hall', s: 19500, lateral: 150, scale: 1, yaw: Math.PI / 2, sink: -2.8, castShadow: false }
 ];
+
+/**
+ * 南环（Südschleife 7.747 km）地标摆放 —— 与北环同构的 6 处（大门×2 / 塔群×3 / 主殿×1）。
+ *
+ * s 按 suedschleife.ts 的 SUED_WAYPOINTS 走向映射（0..7747；探针实测曲率/净空）：
+ *  · 起点直道入口大门 s=200（曲率 0.0004，直道）——起跑即穿门楼；
+ *  · Südkehre 发夹城堡 s=936（lateral −70）——发夹外弯一侧，塔群内缘 18.8m 不侵路面；
+ *  · Müllenbach 发夹城堡 s=3495（lateral +70）——南环标志性发夹；
+ *  · V36 满铺：第 3 座城堡 s=2145（lateral +70，右弯外侧）——左岸分布与北环同构；
+ *  · 长爬坡主殿 s=4708（lateral +120，yaw π/2 立面沿坡铺开）——爬坡高点主殿剪影；
+ *  · 回程直道大门 s=7500（曲率 0.0009，直道）——北端回程、收尾前穿门楼。
+ *
+ * 南环地形比北环窄 ⇒ 塔群保持 lateral ±70（同北环，护栏外净空 +7.8m，实测全环最近
+ * 中心线 70m，发夹不把另一段路带进塔群足迹）；主殿收窄到 120（北环 150，南环爬坡
+ * 走廊 x≤400 更挤，净空 +3.8m 保守 / 实际立面横向仅 37m ⇒ 净空 >70m）。
+ * sink 沿用北环量级（gate −0.9 / castle −2.4 / hall −2.8）。
+ */
+const SUEDSCHLEIFE_PLACEMENTS: readonly Placement[] = [
+  // ── 大门 ×2（近景，跨路，高配 + castShadow）
+  { kind: 'gate', s: 200, lateral: 0, scale: 1, yaw: 0, sink: -0.9, castShadow: true },
+  { kind: 'gate', s: 7500, lateral: 0, scale: 1, yaw: 0, sink: -0.9, castShadow: true },
+  // ── 城堡塔群 ×3（远景，低配，不投影）
+  // V36 满铺：第 3 座 s=2145（curv −0.0061 右弯，弯外侧=行进方向左侧 lat +70）。
+  //   · 落点探针（南环 track）：足迹 span 6.17m，sink 反解 −2.37 ≈ 现有 −2.4 ⇒ 用 −2.4
+  //     让基座底（−15.20）微埋足迹最低点（−15.17）0.03m 触地；近侧埋 6.2m 读作嵌进山坡；
+  //   · 内缘 = 70 − 51.2（scale0.9 半宽）= 18.8m > 路肩外缘 11.6m，不侵路面/路肩；
+  //   · 避让：距城堡 936=1209m / 城堡 3495=1350m / 主殿 4708=2563m / 大门 7500=5355m /
+  //     起点门 200=1945m / Müllenbach 看台 3505=1360m，全部 > 避让窗口 300m；
+  //   · 分布：左岸（s2145+s3495+主殿 4708）右岸（s936），与北环「左多右少」同构。
+  //   · ⚠ 勿用 s5275（span 7.81m 太陡，sink 需 −4.44 近侧埋 7.8m，观感半埋过多）。
+  { kind: 'castle', s: 936, lateral: -70, scale: 0.9, yaw: 0, sink: -2.4, castShadow: false },
+  { kind: 'castle', s: 2145, lateral: 70, scale: 0.9, yaw: 0, sink: -2.4, castShadow: false },
+  { kind: 'castle', s: 3495, lateral: 70, scale: 0.9, yaw: 0, sink: -2.4, castShadow: false },
+  // ── 主殿 ×1（远景，低配，不投影；前脸转向路心）
+  { kind: 'hall', s: 4708, lateral: 120, scale: 1, yaw: Math.PI / 2, sink: -2.8, castShadow: false }
+];
+
+/** 按赛道模式选地标表（北环默认；南环走 SUEDSCHLEIFE_PLACEMENTS） */
+function placementsFor(mode: TrackMode): readonly Placement[] {
+  return mode === 'suedschleife' ? SUEDSCHLEIFE_PLACEMENTS : NORDSCHLEIFE_PLACEMENTS;
+}
 
 /**
  * 越界件裁剪阈值（|x|，m）。`TOWER_GROUP.wing.xEnd = 55` 是翼墙设计外缘，但
@@ -197,16 +238,22 @@ export class Landmarks {
   private readonly geometries: THREE.BufferGeometry[] = [];
   private readonly materials: THREE.Material[] = [];
   private readonly textures: THREE.Texture[] = [];
+  /** 当前赛道的地标表（构造时按 mode 选定，之后不变） */
+  private readonly placements: readonly Placement[];
 
-  /** @param lowDetail 低质量档：近景大门也降装饰密度（几何尺寸逐位不变） */
-  constructor(scene: THREE.Scene, lowDetail = false) {
+  /**
+   * @param lowDetail 低质量档：近景大门也降装饰密度（几何尺寸逐位不变）
+   * @param mode 赛道模式（北环默认 / 南环走 SUEDSCHLEIFE_PLACEMENTS）
+   */
+  constructor(scene: THREE.Scene, lowDetail = false, mode: TrackMode = 'nordschleife') {
     this.group.name = 'landmarks';
+    this.placements = placementsFor(mode);
 
     // 近景组（castShadow=true）/ 远景组分开合批：castShadow 只能逐 mesh 给
     const near = emptyFamilies();
     const far = emptyFamilies();
 
-    for (const p of PLACEMENTS) {
+    for (const p of this.placements) {
       // 远景走低配。setDetailLevel 是 castleKit 的模块级开关 ⇒ 必须在 **build 之前**置位
       setDetailLevel(lowDetail || !p.castShadow);
       this.buildPlacement(p, p.castShadow ? near : far);
@@ -228,11 +275,16 @@ export class Landmarks {
       ashlar: new THREE.MeshStandardMaterial({
         map: ashlarTex,
         color: 0xe5dcd9,
-        roughness: 0.9,
-        metalness: 0.04,
-        envMapIntensity: 0.35
+        roughness: 0.82,
+        metalness: 0.05,
+        envMapIntensity: 0.55
       }),
-      gold: new THREE.MeshStandardMaterial({ color: 0xa2771d, roughness: 0.34, metalness: 0.85 }),
+      gold: new THREE.MeshStandardMaterial({
+        color: 0xa2771d,
+        roughness: 0.22,
+        metalness: 0.95,
+        envMapIntensity: 1.0
+      }),
       dark: new THREE.MeshStandardMaterial({ color: 0x1a1714, roughness: 1, metalness: 0 }),
       // 火焰：UnrealBloom threshold .72 只吃线性亮度 > .72 的像素，0xffb020 单独用线性
       // 亮度 ≈ .52 不出辉光 ⇒ 按旧仓口径（brake-v800 castle.ts 的 ×2.4）乘 2.2
@@ -452,5 +504,7 @@ export class Landmarks {
   }
 }
 
-/** 导出摆放表快照（单测/探针按它断言「不侵路面」等硬约束） */
-export const LANDMARK_PLACEMENTS: readonly Placement[] = PLACEMENTS;
+/** 北环摆放表快照（单测/探针按它断言「不侵路面」等硬约束） */
+export const LANDMARK_PLACEMENTS: readonly Placement[] = NORDSCHLEIFE_PLACEMENTS;
+/** 南环摆放表快照（单测/探针按它断言「不侵路面」等硬约束） */
+export const SUED_LANDMARK_PLACEMENTS: readonly Placement[] = SUEDSCHLEIFE_PLACEMENTS;

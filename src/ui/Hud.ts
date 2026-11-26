@@ -12,8 +12,14 @@
  *   中心线抽稀到 ~700 点（track.count≈5208，stride 7）——180px 画布下再密也看不出来。
  */
 import { byId, el } from './dom';
-import { getTrack } from '../track/nordschleife';
+import { getTrack, type TrackMode } from '../track/nordschleife';
 import { formatDelta, formatLapTime, type LapState } from '../core/LapTimer';
+
+/** 小地图标签文案（含里程，与 Menu 赛道按钮口径一致） */
+const MAP_LABEL: Record<TrackMode, string> = {
+  nordschleife: 'GELLHORN RACEWAY · 20.832 km',
+  suedschleife: 'GELLHORN SOUTH · 7.747 km'
+};
 
 /** 文本刷新间隔 ms */
 const TEXT_INTERVAL = 100;
@@ -39,15 +45,19 @@ export class Hud {
   private readonly toastEl: HTMLElement;
   private readonly countEl: HTMLElement;
   private readonly splitBox: HTMLElement;
+  private readonly mapLabel: HTMLElement;
+  /** 前方刹车点提示（cornerHint；null 时隐藏） */
+  private readonly cornerEl: HTMLElement;
 
   private readonly mapCanvas: HTMLCanvasElement;
   private readonly mapCtx: CanvasRenderingContext2D;
-  private readonly mapBase: HTMLCanvasElement;
-  private readonly mapScale: number;
-  private readonly mapOriginX: number;
-  private readonly mapOriginZ: number;
-  private readonly mapMinX: number;
-  private readonly mapMinZ: number;
+  /** 换赛道时经 setTrack 重算，故非 readonly */
+  private mapBase: HTMLCanvasElement;
+  private mapScale: number;
+  private mapOriginX: number;
+  private mapOriginZ: number;
+  private mapMinX: number;
+  private mapMinZ: number;
 
   private visible = false;
   private lastTextAt = 0;
@@ -66,7 +76,8 @@ export class Hud {
     s2: '',
     s3: '',
     speed: '',
-    gear: ''
+    gear: '',
+    corner: ''
   };
 
   constructor() {
@@ -99,7 +110,8 @@ export class Hud {
 
     /* ── 小地图（右下） ─────────────────────────────────────────────── */
     const mapWrap = el('div', 'hud-map');
-    mapWrap.append(el('div', 'hud-map-label', 'NORDSCHLEIFE · 20.832 km'));
+    this.mapLabel = el('div', 'hud-map-label', MAP_LABEL.nordschleife);
+    mapWrap.append(this.mapLabel);
     this.mapCanvas = document.createElement('canvas');
     this.mapCanvas.width = MAP_SIZE;
     this.mapCanvas.height = MAP_SIZE;
@@ -125,7 +137,34 @@ export class Hud {
     this.toastEl = el('div', 'toast hidden');
     this.countEl = el('div', 'hud-count hidden');
 
-    this.root.append(topLeft, topCenter, topRight, mapWrap, speedBox, this.hintEl, this.toastEl, this.countEl);
+    /* ── 前方刹车点提示（cornerHint）── 底部中上方悬浮胶囊，默认隐藏 ──
+     * 新元素走内联布局（styles.css 无可复用类）：位置在提示条(hud-hint)之上。 */
+    this.cornerEl = el('div', 'hud-corner mono hidden', '');
+    this.cornerEl.style.position = 'absolute';
+    this.cornerEl.style.left = '50%';
+    this.cornerEl.style.bottom = '112px';
+    this.cornerEl.style.transform = 'translateX(-50%)';
+    this.cornerEl.style.padding = '6px 16px';
+    this.cornerEl.style.borderRadius = '999px';
+    this.cornerEl.style.background = 'rgba(0,0,0,0.5)';
+    this.cornerEl.style.border = '1px solid rgba(241,220,174,0.45)';
+    this.cornerEl.style.fontSize = '13px';
+    this.cornerEl.style.letterSpacing = '0.5px';
+    this.cornerEl.style.color = '#ffd98a';
+    this.cornerEl.style.whiteSpace = 'nowrap';
+    this.cornerEl.style.textShadow = '0 1px 6px rgba(0,0,0,0.8)';
+
+    this.root.append(
+      topLeft,
+      topCenter,
+      topRight,
+      mapWrap,
+      speedBox,
+      this.hintEl,
+      this.toastEl,
+      this.countEl,
+      this.cornerEl
+    );
 
     // 小地图等比映射参数（构造期算一次）
     const b = getTrack().bounds;
@@ -165,6 +204,24 @@ export class Hud {
     this.root.classList.toggle('paused', paused);
   }
 
+  /**
+   * 换赛道：重算小地图（bounds/中心线/起终线）+ 更新标签。
+   * 由 Game 在构造（修正 Hud 字段初始化器早建的默认图）与 selectTrack 时调用。
+   */
+  setTrack(mode: TrackMode): void {
+    const b = getTrack().bounds;
+    const spanX = Math.max(1, b.maxX - b.minX);
+    const spanZ = Math.max(1, b.maxZ - b.minZ);
+    this.mapScale = (MAP_SIZE - MAP_PAD * 2) / Math.max(spanX, spanZ);
+    this.mapOriginX = (MAP_SIZE - spanX * this.mapScale) / 2;
+    this.mapOriginZ = (MAP_SIZE - spanZ * this.mapScale) / 2;
+    this.mapMinX = b.minX;
+    this.mapMinZ = b.minZ;
+    this.mapBase = this.buildMapBase();
+    this.mapLabel.textContent = MAP_LABEL[mode];
+    this.lastMapAt = 0;
+  }
+
   /** 倒计时文本（'3' / '2' / '1' / 'GO!'）；传 null 隐藏 */
   setCountdown(text: string | null): void {
     if (text === null) {
@@ -184,17 +241,39 @@ export class Hud {
    * @param s 沿路弧长（m）
    * @param heading 航向 rad（小地图车头朝向）
    * @param gear 挡位 D/R/N
+   * @param cornerHint 前方刹车点提示（Drive.telemetry.cornerHint；null=无）
    */
-  update(lap: LapState, speedKmh: number, s: number, heading: number, gear: string): void {
+  update(
+    lap: LapState,
+    speedKmh: number,
+    s: number,
+    heading: number,
+    gear: string,
+    cornerHint: { name: string; distanceToBrake: number } | null = null
+  ): void {
     if (!this.visible) return;
     const now = performance.now();
     if (now - this.lastTextAt >= TEXT_INTERVAL) {
       this.lastTextAt = now;
       this.updateText(lap, speedKmh, gear);
+      this.updateCornerHint(cornerHint);
     }
     if (now - this.lastMapAt >= MAP_INTERVAL) {
       this.lastMapAt = now;
       this.drawMap(s, heading);
+    }
+  }
+
+  /** 前方刹车点提示（10Hz；cornerHint null 隐藏；distanceToBrake 保留整数米） */
+  private updateCornerHint(hint: { name: string; distanceToBrake: number } | null): void {
+    const text = hint ? `${hint.name} · ${Math.max(0, Math.round(hint.distanceToBrake))}m 刹` : '';
+    if (this.text.corner === text) return;
+    this.text.corner = text;
+    if (hint) {
+      this.cornerEl.textContent = text;
+      this.cornerEl.classList.remove('hidden');
+    } else {
+      this.cornerEl.classList.add('hidden');
     }
   }
 

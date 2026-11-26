@@ -17,7 +17,9 @@
  */
 import { BRAKE, DRIVE as DRIVE_POWER, GRAVITY, MS_TO_KMH, VEHICLE } from '../config/physics';
 import { getTrack } from '../track/nordschleife';
+import { nextCornerAt } from '../track/cornerData';
 import { clamp, damp } from '../util/math';
+import { FREE_BODY_IMPACT_OSC } from '../config/freeBodyFeel';
 
 /* ══ 标定表（集中一处，便于复算） ══════════════════════════════════════════ */
 export const DRIVE_MODEL = {
@@ -52,9 +54,11 @@ export const DRIVE_MODEL = {
   /** 转角收窄区间（km/h）：18 → 60（旧仓 FREE 表；120 时仍按满收窄值 0.48 处理） */
   steerLowKmh: 18,
   steerHighKmh: 60,
-  /** 转向输入一阶时间常数（低速/高速） */
+  /** 转向输入一阶时间常数（低速/高速）
+   *  V2 手感微调：steerTauHigh 0.14 → **0.134**（−4.3%，±5% 内）——高速转向略更利落，
+   *  减轻「120km/h 打舵等半拍」的肉感；低速 steerTauLow 0.07 不动（低速已够跟手）。 */
   steerTauLow: 0.07,
-  steerTauHigh: 0.14,
+  steerTauHigh: 0.134,
   /** caster 自回正：回正方向 τ 比率 */
   steerReturnRatio: 0.7,
   /**
@@ -96,8 +100,12 @@ export const DRIVE_MODEL = {
   pitchLimitRad: 0.2,
   /** 路肩抓地衰减（|lateral| > 8.4） */
   shoulderGrip: 0.86,
-  /** 护栏位置（|lateral| = 10.6 触发碰撞） */
-  railLimit: 10.6,
+  /** V21 砾石抓地下限（护栏前 |lateral|=10.1）：8.4→0.86 线性渐降至 10.1→0.72 */
+  gravelGripFloor: 0.72,
+  /** 护栏碰撞横向极限：护栏梁在 ±11.2（Track.ts），车身半宽 ~1.0（V800 2.006m）
+   *  ⇒ clamp = railOffset − halfWidth − 0.1 余量 = 10.1，车身外缘 11.1 < 11.2 不穿梁。
+   *  测试断言 |lateral| ≤ 10.7（10.1 + 1 步容差仍兼容）。 */
+  railLimit: 10.1,
   /** 护栏碰撞速度保留比例 */
   railKeep: 0.82,
   /** 碰撞事件冷却 s（防 120Hz 每步触发） */
@@ -159,6 +167,8 @@ export interface DriveTelemetry {
   y: number;
   throttle: number;
   brake: number;
+  /** 前方刹车点提示（cornerData.nextCornerAt 逐帧刷新；null=无刹车点/全在巡航内） */
+  cornerHint: { name: string; distanceToBrake: number } | null;
 }
 
 /**
@@ -258,6 +268,11 @@ export class Drive {
   private rollVel = 0;
   private pitchBody = 0;
   private pitchVel = 0;
+  /** R126 撞墙「被顶晃动」欠阻尼二阶通道（目标=0 自由振荡，叠加在 rollBody/pitchBody 上） */
+  private impactRollOsc = 0;
+  private impactRollOscVel = 0;
+  private impactPitchOsc = 0;
+  private impactPitchOscVel = 0;
   private impactCooldown = 0;
   private readonly telemetryObj: DriveTelemetry = {
     speedKmh: 0,
@@ -267,8 +282,11 @@ export class Drive {
     gear: 'N',
     y: 0,
     throttle: 0,
-    brake: 0
+    brake: 0,
+    cornerHint: null
   };
+  /** 复用的 cornerHint 对象（避免每帧新分配；telemetryObj.cornerHint 指向它） */
+  private cornerHintObj: { name: string; distanceToBrake: number } | null = null;
 
   constructor() {
     this.resetToStart();
@@ -314,6 +332,10 @@ export class Drive {
     this.rollVel = 0;
     this.pitchBody = 0;
     this.pitchVel = 0;
+    this.impactRollOsc = 0;
+    this.impactRollOscVel = 0;
+    this.impactPitchOsc = 0;
+    this.impactPitchOscVel = 0;
     this.impactCooldown = 0;
     this.onBodyPose?.(0, 0);
   }
@@ -350,15 +372,54 @@ export class Drive {
     st.rearGrip = damp(st.rearGrip, gripTarget, 1 / (input.handbrake ? D.gripDecayTau : D.gripRecoverTau), dt);
 
     /* ── 3. 横向：yawRate = v·tan(δ)/L，摩擦圆钳 |v·yawRate| ≤ μg ─────── */
-    const onShoulder = Math.abs(lateral) > 8.4;
-    const mu = D.tyreMu * (onShoulder ? D.shoulderGrip : 1);
-    const gripLat = mu * GRAVITY;
-    const kin = (v * Math.tan(st.steer)) / D.wheelbaseM;
+    const latAbs = Math.abs(lateral);
+    const onShoulder = latAbs > 8.4;
+    // V21 砾石抓地深度渐变：|lateral| 8.4→0.86 .. 10.1（护栏前）→0.72，路面恒 1.0。
+    // 跑宽上砾石（弯道外侧跑偏区）抓地随深度线性下滑，真正付出抓地代价。
+    const shoulderFactor = onShoulder
+      ? D.shoulderGrip - (D.shoulderGrip - D.gravelGripFloor) * clamp((latAbs - 8.4) / (10.1 - 8.4), 0, 1)
+      : 1;
+    const mu = D.tyreMu * shoulderFactor;
+    // V6 横倾（bank）内倾帮助过弯（AC 式「倾角」物理）：路面朝弯内倾斜，重力沿坡面
+    // 产生向弯内分力 g·sin(|bank|)，净可用横向抓地 = mu·g·cos(bank) + g·sin(bank)。
+    // bank 生成规则「左弯左低」（nordschleife）⇒ 恒内倾 ⇒ 恒帮助（|bank|≤5.5° ⇒ +≤0.94 m/s²）。
+    // 直道/起点 bank≈0（实测 s=0..800 全 0.00°）⇒ 对转弯半径、yawRate、0-100 回归无影响。
+    const bankAbs = Math.abs(bank);
+    const gripLat = mu * GRAVITY * Math.cos(bankAbs) + GRAVITY * Math.sin(bankAbs);
+    // 路肩破坏动态 V2 —— 报告：路肩普遍高而凸，压上破坏动态强（比 V1 更真实）。
+    // 分带（|lateral|）：
+    //   路缘凸起（curb lip） 7.5~8.8 —— 高而凸，压上「顶一下」，向内推很强（×1.6）；
+    //   土路肩（gravel）    8.8~10.1 —— 松散，持续拖拽（railLimit 之前，草地不可达）。
+    // V25b 路缘惩罚加强（真实纽北「路肩很高，绝逼不能有吃路肩的想法」）：
+    //   路缘带（7.5~8.8）curbTier 1.2 → **1.6**（更强向内推），curbYaw 系数 0.04 → **0.06**
+    //   （更强横摆失稳，读作「压路缘弹跳失控前兆」）；砾石带（8.8~10.1）curbTier 仍 1.0 不动。
+    // 随速增强：≤60km/h 无破坏（正常路面 / 低速完全不受影响），80km/h 达 V1 基线 1.0，
+    //           160km/h 饱和 1.4×（速度越高破坏越强）。
+    // 方向恒为向路内（减小 |lateral|）；整量被下方 cap 钳住 ⇒ 不突破摩擦圆 / yawRate 断言。
+    const speedK =
+      speedKmh <= 60 ? 0 : speedKmh >= 160 ? 1.4 : clamp((speedKmh - 60) / 20, 0, 1) * (1 + 0.4 * clamp((speedKmh - 80) / 80, 0, 1));
+    const depth = latAbs > 7.5 ? clamp((latAbs - 7.5) / 2, 0, 1) : 0; // 7.5→0 .. 9.5→1
+    const curbTier = latAbs > 7.5 && latAbs < 8.8 ? 1.6 : 1.0; // 路缘凸起很强（V25b：1.2→1.6）
+    const curbMag = depth * curbTier * speedK; // 0..2.24（速度/分带增强）
+    const curbYaw = curbMag > 0 ? -Math.sign(lateral) * curbMag * 0.06 : 0; // 向路内 rad/s（V25b：0.04→0.06）
+    const kin = (v * Math.tan(st.steer)) / D.wheelbaseM + curbYaw;
     // 手刹时后轴抓地下降 ⇒ 允许比前轮附着略大的横摆（甩尾的「转」分量）
-    const driftYawBoost = 1 + (1 - st.rearGrip) * 0.35;
+    // 弯中纵向载荷转移（用上一步纵向加速度 st.accel 作代理）：加速时后轴卸载 ⇒ 横摆略活
+    // （油门转），制动时前轴加载 ⇒ 横摆略稳（刹车稳）。幅度 ±6%，只改 yaw 动态，
+    // 不改变总摩擦圆 / 制动距离 / 转弯半径基线（见 drive_model 回归）。
+    const loadK = clamp(st.accel / D.brakeDecelMs2, -1, 1);
+    const driftYawBoost = (1 + (1 - st.rearGrip) * 0.35) * (1 + loadK * 0.06);
     const cap = Math.min(D.maxYawRate, (gripLat / Math.max(av, D.refSpeedMs)) * driftYawBoost);
-    const yawTarget = clamp(kin, -cap, cap);
-    st.yawRate = damp(st.yawRate, yawTarget, 1 / D.yawResponseTau, dt);
+    // V3 轮胎侧偏非线性过渡：载荷利用率 u = |yawRate·v|/gripLat 接近极限（>0.85）时
+    // 前轮侧偏角增大 → 抓地渐进下滑 → 转向响应渐钝（推头/滑移前兆），幅值 ≤4%。
+    // 低速转弯利用率仅 ~0.5（不触发），故转弯半径 / 低速手感不受影响；只软化高速极限区。
+    let yawTarget = clamp(kin, -cap, cap);
+    const util = Math.min(1, Math.abs(st.yawRate * v) / gripLat);
+    const soften = 1 - 0.04 * clamp((util - 0.85) / 0.15, 0, 1);
+    yawTarget *= soften;
+    // 横摆响应随速度微调（±5% 内）：高速略增阻尼（更稳不飘），低速更跟手。
+    const yawTau = D.yawResponseTau * (1 + 0.05 * clamp((speedKmh - 80) / 120, 0, 1));
+    st.yawRate = damp(st.yawRate, yawTarget, 1 / yawTau, dt);
 
     /* 推头：请求横摆超过抓地上限 ⇒ 削速（前轮侧偏饱和的耗散） */
     const over = Math.abs(kin) - cap;
@@ -368,15 +429,29 @@ export class Drive {
     const latUse = Math.min(gripLat, Math.abs(st.yawRate * v));
     const longAvail = Math.sqrt(Math.max(0, D.brakeDecelMs2 * D.brakeDecelMs2 - latUse * latUse));
     const driveAvail = Math.sqrt(Math.max(0, gripLat * gripLat - latUse * latUse));
+    // V3 起步扭矩爬坡：0→12km/h 驱动极限从 90% 线性爬满（重车起步沉稳不窜，
+    // 而非瞬时满扭矩「窜出去」）；≥12km/h 全扭矩（不影响 0-100 主体，见回归）。
+    // 幅度 10%（±5% 内保守微调）——起步初段略柔、不窜，12km/h 后与 V2 一致。
+    const launchK = speedKmh <= 12 ? 0.9 + 0.1 * (speedKmh / 12) : 1;
+    const driveLimit = D.driveLimitN * launchK;
     const motorForce =
-      Math.min((D.powerW * D.driveEfficiency) / Math.max(av, 1), D.driveLimitN) *
+      Math.min((D.powerW * D.driveEfficiency) / Math.max(av, 1), driveLimit) *
       clamp(input.throttle, 0, 1);
 
     let a = 0;
+    // V3 怠速蠕行：D 挡松油门/松刹车低速缓慢滑行（≤5km/h），模拟液力变矩器怠速带
+    // （重车蠕行沉稳不窜）；只在前进/静止、无刹车无手刹时生效，超 5km/h 即停（不叠加驱动）。
+    // 幅度 0.45 m/s²（≈0.05g）—— 低速蠕行真实感；对 0-100 / 制动 / 巡航均无实质影响。
+    if (v >= 0 && input.brake <= 0 && !input.handbrake && speedKmh < 5) a += 0.45;
     if (motorForce > 0) a += Math.min(motorForce / D.massKg, driveAvail);
     if (input.brake > 0) {
-      if (v > BRAKE.stopSpeed) a -= Math.min(D.brakeDecelMs2, longAvail) * clamp(input.brake, 0, 1);
-      else a -= D.reverseAccelMs2; // 停稳后同键转倒车
+      if (v > BRAKE.stopSpeed) {
+        // V3 渐进制动踏板感：brake 经 smoothstep 映射（小脚更渐进、大脚近线性），
+        // brake=1 → 映射=1（制动距离 / ABS 1.1g 基线不变，见 drive_model 回归）。
+        const b = clamp(input.brake, 0, 1);
+        const bEff = b * b * (3 - 2 * b);
+        a -= Math.min(D.brakeDecelMs2, longAvail) * bEff;
+      } else a -= D.reverseAccelMs2; // 停稳后同键转倒车
     }
     if (input.handbrake) a -= dir * Math.min(D.handbrakeDecel, longAvail);
     const drag = 0.5 * D.airDensity * D.dragCd * D.frontalAreaM2 * v * v;
@@ -384,7 +459,18 @@ export class Drive {
     if (dir !== 0) {
       a -= dir * ((drag + roll) / D.massKg);
       a -= dir * scrub;
+      // 路肩附加阻力（V2 随速/分带增强，≤0.25 m/s²）
+      // V21 砾石带（8.8-10.1）拖拽略增：max 0.12*1.4≈0.17 m/s²，跑宽上砾石真正变慢。
+      const gravelDepth = latAbs > 8.8 ? clamp((latAbs - 8.8) / 1.3, 0, 1) : 0;
+      a -= dir * (curbMag * 0.15 + gravelDepth * 0.12 * speedK);
     }
+
+    // V4 纵向重力分量（AC 式「斜坡/倾角」物理）：上坡减速 / 下坡加速。
+    // f.grade = 中心差分 dy/ds = sin(坡度角)；重力沿坡分量 g·sin α = g·grade。
+    // 方向恒沿 ±s（重力只随坡向、不随车头）；乘 sign(v) 使掉头/倒车符号正确，
+    // v=0 静止不滑（简化，无坡道溜车模型）。纽北 |grade|max≈0.072 ⇒ ≤0.71 m/s²，
+    // 直道标定段（s=17200）|grade|≈0.0083 ⇒ ≈0.08 m/s²，落在 0-100/制动回归容差内。
+    a -= GRAVITY * f.grade * Math.sign(v);
 
     let vNext = v + a * dt;
     if (vNext > D.maxSpeedMs) vNext = D.maxSpeedMs;
@@ -442,6 +528,10 @@ export class Drive {
         st.speed = vNext * D.railKeep;
         const strength = clamp(av / 25, 0.12, 1);
         this.onImpact?.(strength, st.x, st.y + 0.7, st.z);
+        // R126 撞墙「被顶晃动」：一次性注入角速度（撞击法向速度 av 加权，pitch 负=车头朝墙点头），
+        // 下方二阶自由振荡过冲回摆一次。与旧仓 FREE_BODY_IMPACT_OSC 同源（ω8/ζ0.5），只叠视觉姿态。
+        this.impactRollOscVel += FREE_BODY_IMPACT_OSC.rollGain * av;
+        this.impactPitchOscVel -= FREE_BODY_IMPACT_OSC.pitchGain * av;
       } else {
         // 贴墙持续刮擦：轻微耗散（不重复触发撞击演出）
         st.speed = vNext * Math.exp(-1.5 * dt);
@@ -450,8 +540,10 @@ export class Drive {
 
     /* ── 9. 视觉姿态（R156 二阶悬挂 + 路面坡度/横倾）─────────────────── */
     const latAccel = st.yawRate * vAvg; // 正 = 左转（与旧仓 roll 目标同号）
+    // 路肩「顶一下」侧倾扰动：压上高凸路缘，车身朝路内微倾（视觉小颠簸，≤0.012rad）。
+    const curbRoll = curbMag > 0 ? -Math.sign(lateral) * curbMag * 0.012 : 0;
     const rollTarget =
-      suspensionTarget(latAccel, D.rollMaxRad, D.rollRefMs2, 0.7, 7.0) - bank;
+      suspensionTarget(latAccel, D.rollMaxRad, D.rollRefMs2, 0.7, 7.0) - bank + curbRoll;
     const pitchTarget =
       suspensionTarget(st.accel, D.pitchMaxRad, D.pitchRefMs2, 0.7, 11.0) +
       Math.atan(f.grade);
@@ -471,8 +563,19 @@ export class Drive {
       D.susZeta,
       dt
     );
-    st.roll = clamp(this.rollBody, -D.rollLimitRad, D.rollLimitRad);
-    st.pitch = clamp(this.pitchBody, -D.pitchLimitRad, D.pitchLimitRad);
+    // R126 撞墙「被顶晃动」二阶自由振荡（目标=0 衰减；与 R156 常态二阶独立叠加）。
+    // ζ=0.5 ⇒ 一次清晰回摆 ~16%，不过冲失控；幅值由 FREE_BODY_IMPACT_OSC 参数有界。
+    {
+      const oi = FREE_BODY_IMPACT_OSC;
+      const rollAcc = oi.omega * oi.omega * -this.impactRollOsc - 2 * oi.zeta * oi.omega * this.impactRollOscVel;
+      this.impactRollOscVel += rollAcc * dt;
+      this.impactRollOsc += this.impactRollOscVel * dt;
+      const pitchAcc = oi.omega * oi.omega * -this.impactPitchOsc - 2 * oi.zeta * oi.omega * this.impactPitchOscVel;
+      this.impactPitchOscVel += pitchAcc * dt;
+      this.impactPitchOsc += this.impactPitchOscVel * dt;
+    }
+    st.roll = clamp(this.rollBody + this.impactRollOsc, -D.rollLimitRad, D.rollLimitRad);
+    st.pitch = clamp(this.pitchBody + this.impactPitchOsc, -D.pitchLimitRad, D.pitchLimitRad);
     this.onBodyPose?.(st.roll, st.pitch);
   }
 
@@ -486,6 +589,16 @@ export class Drive {
     t.heading = st.heading;
     t.gear = st.speed < -0.2 ? 'R' : Math.abs(st.speed) < 0.05 ? 'N' : 'D';
     t.y = st.y;
+    // 前方刹车点提示（cornerData.nextCornerAt，按当前赛道 length 分流；环绕取正；复用对象避免每帧分配）
+    const hint = nextCornerAt(st.s, getTrack().length);
+    if (hint) {
+      if (!this.cornerHintObj) this.cornerHintObj = { name: '', distanceToBrake: 0 };
+      this.cornerHintObj.name = hint.corner.name;
+      this.cornerHintObj.distanceToBrake = hint.distanceToBrake;
+      t.cornerHint = this.cornerHintObj;
+    } else {
+      t.cornerHint = null;
+    }
     return t;
   }
 }

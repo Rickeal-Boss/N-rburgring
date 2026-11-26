@@ -1321,22 +1321,30 @@ export function makeGate(): StoneBuckets {
   }
 
   // ── R36-A2 城门门扇（inner-wood 变体桶）：大门敞开，两扇巨型木门折靠门洞侧墙。
-  //    尖拱剖面（springing ±10/0、apex 0/28.5+1.5 ⇒ 弧心 −35.6、半径 45.6）在
-  //    |x|=9.06 处净高 ≈9.2m ⇒ 门高 7m 不穿拱；门厚 0.28 贴 liner（9.55）内侧留
-  //    ≥21cm；|x| ≥ 9.06 > 8 走廊铁律不侵。门面朝路心（∓x）。门钉/徽章走
+  //    尖拱剖面（springing ±12/0、apex 0/28.5+1.5 ⇒ 弧心 −40.6、半径 52.6）在
+  //    |x|=11.3 处净高 ≈8.55m ⇒ 门高 7m 不穿拱；门厚 0.28 贴 liner（11.55）内侧留
+  //    ≈11cm；|x| ≥ 11.3 > 8 走廊铁律不侵。门面朝路心（∓x）。门钉/徽章走
   //    gilded-aged（agedGold 桶）。每扇 ≈204 tri ×2。
+  //    （R95：随 openW 20→24 外移 9.2→11.2；R96：11.2→11.3 闭合门扇边缘穿模——
+  //     车身外缘 railLimit 10.1 + 半宽 1.003 = 11.103 > 原门扇内表面 11.06 侵入 0.043m。）
   for (const side of [-1, 1] as const) {
     pour(
       b,
-      mapParts(doorLeaf({ w: 8, h: 7 }), (g) => g.rotateY(-side * Math.PI / 2).translate(side * 9.2, 0, zFront - 4))
+      mapParts(doorLeaf({ w: 8, h: 7 }), (g) => g.rotateY(-side * Math.PI / 2).translate(side * 11.3, 0, zFront - 4))
     );
   }
 
-  // ── 中央石体量：以门洞拱形为下边界，顶到 massTop
-  const mass = archWall(openHalf, 0, massTop, rise, depth, 10, cusp, 0.35);
-  mass.translate(0, 0, zFront);
-  b.ashlar.push(mass);
-  // 体量顶檐口两层 + 中央尖塔（44 → 55 = totalH）+ 金宝顶
+    // ── 中央石体量：以门洞拱形为下边界，顶到 massTop
+    const mass = archWall(openHalf, 0, massTop, rise, depth, 10, cusp, 0.35);
+    mass.translate(0, 0, zFront);
+    b.ashlar.push(mass);
+    // V2 近景细节：拱上石体量前脸横向金线（日轮顶 y≈39.7 之上、檐口 44 之下）——
+    //   日轮与檐口之间原是一段 4.3m 纯白石带，近景（gate_hero / gate_near 机位）读作
+    //   "空白横条"。金线把它切成「日轮 → 金线 → 檐口」三带节奏（参考图门楼拱上
+    //   金饰带语汇）。x±8.5 略收，不碰日轮（r6.2）/翼卷（y 34.5~36.3）；
+    //   zFront+0.06 凸出前脸防 z-fight。进既有 gold 桶 ⇒ +0 DC / +12 tri。
+    b.gold.push(box('gold', 17, 0.24, 0.12, 0, 41.8, zFront + 0.06));
+    // 体量顶檐口两层 + 中央尖塔（44 → 55 = totalH）+ 金宝顶
   // R33：中央塔冠改 crookedSpire（层叠卷叶金冠 + 金尖）；h=7.3 时实际冠高
   // 1.42×7.3≈10.4，仍收在 totalH=55 —— 不抬高门楼总高，只把「单一三角锥」换成
   // 参考图的「白石冠座 + 卷叶金钉 + 金尖」语汇。低配自动只保留锥身/金尖。
@@ -2547,6 +2555,30 @@ export function makeMainHall(): StoneBuckets {
     // 尖顶冠（kit④ 细杆语言，无钟面）
     const rodH = crownH - frontH; // 34
     b.ashlar.push(box('ashlar', 9, 5, 9, 0, frontH + 2.5, zMidFront)); // 冠座
+    /* V2 近景细节：冠座四角小尖塔（哥特尖顶冠的角塔语汇）——冠座 9m 白盒顶部原是
+     * 平顶，130m 尖顶冠在 hall_front / hall_approach 机位读作"白盒 + 单锥"，
+     * 天际线没有哥特角塔的起伏。角位 (±4, zMidFront±4) 落冠座顶（y = frontH+5），
+     * 与中央金锥（底 r3.6 @ y101）不冲突：角塔内缘距轴 3.4 > 金锥在 y104.6 的 r≈3.15。
+     * 形制同塔群钟楼四角小尖塔（box + 4 面小尖帽 + 金尖），spire 段数恒 4。
+     * ⚠ 低档守卫（铁律 33 只降装饰密度）：角塔是装饰件，低档整组跳过 ⇒ 低档 tri 0 增量；
+     *   主殿远景件（ashlar-far, setDetailLevel(true)）不会为它买单。
+     * 高档：+0 DC / +144 tri（4 角塔，进既有 ashlar/gold 桶）。
+     */
+    if (!isLowDetail()) {
+      for (const ox of [-1, 1] as const) {
+        for (const oz of [-1, 1] as const) {
+          const ax = ox * 4;
+          const az = zMidFront + oz * 4;
+          b.ashlar.push(box('ashlar', 1.1, 1.0, 1.1, ax, frontH + 5.5, az));
+          b.ashlar.push(spire('ashlar', 0.55, 0, 2.4, 4, ax, frontH + 6.0, az, Math.PI / 4));
+          b.gold.push(spire('gold', 0.14, 0, 0.7, 4, ax, frontH + 8.4, az));
+        }
+      }
+    }
+    // V2 近景细节：冠座正面檐口金线（读作"冠座线脚"）——正面原是 9×5 纯白平墙，
+    //   冠座读作"白盒"。金线横贯正面中部（y = frontH+2.5），zMidFront+4.56 凸出
+    //   正面 0.06m 防 z-fight。+0 DC / +12 tri。
+    b.gold.push(box('gold', 9.2, 0.22, 0.12, 0, frontH + 2.5, zMidFront + 4.56));
     b.gold.push(spire('gold', 3.6, 0, rodH - 5, 8, 0, frontH + 5, zMidFront, Math.PI / 8));
     b.gold.push(spire('gold', 0.5, 0.5, 0.8, 8, 0, frontH + 4.9, zMidFront));
     b.gold.push(spire('gold', 0.42, 0, 2.4, 6, 0, crownH, zMidFront));

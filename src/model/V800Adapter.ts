@@ -5204,6 +5204,8 @@ const R48_LAMP_TONE: boolean =
   // ---- R44 状态：外部壳句柄 / 程序化外观隐藏标记 / 最近一次内舱态 ----
   // （声明在 setPaintShadow 之前，异步装载回调与既有内舱语义共用）
   let shellHandle: ExternalShellHandle | null = null;
+  /** R94：适配器已销毁 → 在途壳加载完成后立即释放新加载资源、不挂载（销毁竞态修复） */
+  let shellDisposed = false;
   /* ── R80 · V800 车顶内壁剔除（移植 R7 的 R50 机制；V800 历史上一直缺失）──────────
    * 病根（用户 11-13 image#19 主驾抬头）：cabin 态 bodyMesh 走 DoubleSide，外模车顶
    *   内壁（深色亮面）露在星顶盖板之上 ⇒ 「光滑黑亮弧形面板 + 上方锯齿白边」。
@@ -5255,7 +5257,13 @@ const R48_LAMP_TONE: boolean =
   };
   /** R47：高精度方向盘（仅 cabin 态可见；外景态零 DC / 不透车外） */
   let steeringMesh: THREE.Mesh | null = null;
-  /** R47：高精度盘装配成功后要恒隐藏的程序化盘（防双盘重叠 / z-fighting） */
+  /** V7：程序化方向盘主 pivot（三辐双色方向盘__pivot）。factory spec 的
+   *  sculptComponent.actionProfile.animationRole === 'steer'（hub/气囊/辐条均为 'static'
+   *  且都挂本 pivot 下）⇒ 转本 pivot 绕局部 Z 轴（pivot.axis=[0,0,1]）即可整套盘随动。
+   *  初始 rotation=(0.42,0,0)（盘后仰），仅改 rotation.z（Euler XYZ ⇒ Rz 先绕原始
+   *  盘面法线转、再 Rx 后仰，盘面保持竖直、法线不偏）。 */
+  let steerPivot: THREE.Group | null = null;
+  /** R47：高精盘装配成功后要恒隐藏的程序化盘（防双盘重叠 / z-fighting） */
   const proceduralSteeringMeshes: THREE.Mesh[] = [];
   /** R71：距离门控当前态 —— true = 相机过近，隐藏高精盘、显示程序化盘 */
   let steerNearCam = false;
@@ -5660,6 +5668,7 @@ const R48_LAMP_TONE: boolean =
     try {
     const shell = await loadExternalShell('v800', paintId);
     if (!shell) return; // 失败：保持程序化外观（含回退车漆），运行时零改动
+    if (shellDisposed) { shell.dispose(); return; } // R94：已销毁 → 立即释放新加载资源，不挂载
     shellHandle = shell;
     // 标记外部壳子树：setExteriorHidden 必须跳过（外部壳材质无 sculpt id，
     // 否则会被「id-less 材质按名隐藏」规则连同程序化外观一起藏掉 = 壳隐形）
@@ -5741,6 +5750,13 @@ const R48_LAMP_TONE: boolean =
       // 组件 id 精确匹配 + 全树正则（R40 铁律）；master on 装载失败路径不执行 ⇒ 保持原状。
       root.traverse((o) => {
         const m = o as THREE.Mesh;
+        // V7：缓存程序化方向盘主 pivot（animationRole==='steer'，见声明注释）。先于子 mesh 访问
+        if (!steerPivot && o.type === 'Group') {
+          const sc = (o as THREE.Group).userData?.sculptComponent as
+            | { actionProfile?: { animationRole?: string } }
+            | undefined;
+          if (sc?.actionProfile?.animationRole === 'steer') steerPivot = o as THREE.Group;
+        }
         if (!m.isMesh) return;
         if ((m.userData as { r44External?: boolean }).r44External === true) return;
         if (/方向盘|steering/i.test(m.name)) proceduralSteeringMeshes.push(m);
@@ -6035,8 +6051,14 @@ const R48_LAMP_TONE: boolean =
       lastSpeedKmh = speedKmh;
       drawGauge(speedKmh, forceN, g, gear);
     },
-    setSteer(_angle: number): void {
-      /* 直线赛道无转向输入 */
+    setSteer(angle: number): void {
+      // V7 方向盘视觉转动（旧仓 no-op「直线赛道无转向输入」，新仓自由驾驶需盘随转向）：
+      // 转 steerPivot 绕局部 Z（盘面法线），幅度 = 前轮转角 × 视觉比。st.steer ∈ ±0.48..0.593
+      // （前轮 34° 低速满舵），k=6 ⇒ 满舵盘转 ≈3.56 rad ≈204°（0.57 圈），可见且不夸张。
+      // 方向：steer>0（右转）盘应顺时针（驾驶者视角）。pivot 局部 +Z = 工厂 +Z = 车头，
+      //   驾驶者在局部 −Z 端（车尾）看盘 ⇒ 绕 +Z 正角从驾驶者看即顺时针 ⇒ 取正号。
+      //   （若目检发现盘转反，把 6 改 −6。）
+      if (steerPivot) steerPivot.rotation.z = angle * 6;
     },
     snapPedal(): void {
       if (pedalT >= 0) return; // 只触发一次
@@ -6203,6 +6225,7 @@ const R48_LAMP_TONE: boolean =
       }
     },
     dispose(): void {
+      shellDisposed = true; // R94：先置销毁标记（在途 IIFE 完成时据此释放，而非挂载）
       // R44 外部壳（几何/材质/贴图独立持有，显式释放）
       shellHandle?.dispose();
       shellHandle = null;

@@ -7,6 +7,8 @@
  * R26：颜色/强度全部来自 `src/config/environment.ts` 的 ACTIVE_ENV（白石哥特教堂黄金时刻）。
  * **结构不动**：texel 对齐、补光反方位、rim 位置公式都是前几轮实拍验证过的，
  * 这里只换参数，不换结构 —— 改结构等于把之前验证过的阴影抖动/轮廓线结论全部作废。
+ * V2：叠加一层 ≤6% 的冷暖分工（主光/轮廓偏暖、补光偏冷），增强黄昏/晨光氛围；
+ * 仍是「只换参数，不换结构」，强度/位置/阴影 mapSize 全部保持。
  *
  * ══ R39：阴影从「隔 N 帧重绘」改为「**每帧重绘**」（每帧成本恒定）══════════════
  * 为什么推翻 R31/R38 的节流方案：
@@ -101,6 +103,15 @@ export class Lighting {
     scene.add(this.rim);
     scene.add(this.rimTarget);
     this.rim.target = this.rimTarget;
+
+    // V2 黄昏/晨光氛围微调：在 preset 之上叠加一层极轻的冷暖分工（只 lerp 颜色，≤6%），
+    // 主光/轮廓偏暖、补光偏冷 —— 强化「低角度暖阳 + 冷天空」的黄昏氛围。
+    // V3 极轻微增强（+1%，≤7%）：sun 暖 0.06→0.07、rim 暖 0.05→0.06、fill 冷 0.05→0.06，
+    //   把黄昏冷暖分工再推一档但仍在人眼敏感度下限附近，不推翻 V2 的冷暖分工结构。
+    // 只动颜色，不动强度/位置/阴影（P0 结构保持，零额外开销；阴影 mapSize 仍来自 quality）。
+    sun.color.lerp(new THREE.Color(0xffd9a8), 0.07);
+    this.rim.color.lerp(new THREE.Color(0xffd0a0), 0.06);
+    this.fill.color.lerp(new THREE.Color(0xa9c4e4), 0.06);
 
     // 阴影 texel 对齐的两个基向量（垂直于太阳方向）
     this.basisX.crossVectors(new THREE.Vector3(0, 1, 0), sunDirection).normalize();

@@ -47,8 +47,8 @@ export interface VehicleProfile {
 export const VEHICLE_PROFILES: Record<VehicleId, VehicleProfile> = {
   v800: {
     id: 'v800',
-    name: '尊界V800',
-    subtitle: '行政旗舰 MPV · 390kW 双电机 · 计算质量 3300kg',
+    name: '鼎奢 V680',
+    subtitle: 'auto7 · 行政旗舰 MPV · 390kW 双电机 · 计算质量 3300kg',
     brakeBreakable: true,
     brakeTempGainScale: 0.75,
     massKg: 3300,
