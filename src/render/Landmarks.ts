@@ -121,9 +121,10 @@ export interface Placement {
    * 底面再下沉量（m）。**只对门楼（kind 'gate'）生效**：门洞跨路、底面取路面
    * （frame.center），负值把塔墩埋进路肩外地形。
    * ⚠ 城堡/主殿（kind 'castle'/'hall'）**忽略本值**：底座由 `frameMatrix` 按
-   * `terrainSpanUnder` 对齐地面接触足迹的地形高点（`FOUNDATION.embed`），
-   * 下坡侧高差由 `foundationBuckets` 的基座/挡土墙桥接 —— 旧 sink 按塔群全足迹
-   * 6m 跨度反解，会把唯一触地的门楼过度下沉（"插在地里"），故不再使用。
+   * `terrainSpanUnder` 对齐地面接触足迹（城堡 = 门楼 + 翼墙**并集**，翼墙 y∈[0,29]
+   * 触地）的地形高点（`FOUNDATION.embed`），下坡侧高差由 `foundationBuckets` 的
+   * 基座/挡土墙桥接 —— 旧 sink 按塔群全足迹 6m 跨度反解，会把触地的门楼/翼墙
+   * 过度下沉（"插在地里"），故不再使用。
    */
   sink: number;
   /** 是否投影（只有近景大门给 true；远景件投影只白烧 shadow pass） */
@@ -160,6 +161,10 @@ const NORDSCHLEIFE_PLACEMENTS: readonly Placement[] = [
   // 会在远侧翼墙端头悬空 1.5~1.75m（probe 实测）。按足迹最低点反解 sink 加深到
   // 「远侧触地、近侧埋入横坡」——近侧埋深 1.4~3.2m 是横坡 flat 基座的代价（读作
   // 建筑嵌进山坡，非悬空）。塔群基座 y=40 咬合门楼 massTop=44，sink 只整体平移。
+  // ⚠ C4 修复（本轮）：翼墙**实际 y∈[0,29] 触地**（旧「翼墙基座 y=40 不触地」是误判，
+  // 那是钟楼 clock.baseY=40）。翼墙横向延伸至 ±WING_CROP_X×scale，落在下坡侧更低地形，
+  // 外端悬空 0.43~1.98m（6/6 处探针实测）。`groundFootprintHalf`/`foundationBuckets`
+  // 已扩到 ±WING_CROP_X 覆盖翼墙：基座顶面随底座、底面埋入翼墙地形最低点之下。
   { kind: 'castle', s: 5200, lateral: 70, scale: 0.9, yaw: 0, sink: -2.4, castShadow: false },
   { kind: 'castle', s: 9800, lateral: -70, scale: 0.9, yaw: 0, sink: -2.3, castShadow: false },
   { kind: 'castle', s: 17800, lateral: 70, scale: 1.0, yaw: 0, sink: -1.2, castShadow: false },
@@ -256,9 +261,13 @@ const FOUNDATION = {
 /**
  * 建筑**地面接触足迹**的半幅（沿 s / 沿 lateral，m，世界系）——基座和地形探针都用它。
  *
- * ⚠ 城堡**不能**用塔群全宽：`makeTowerGroup` 的翼墙基座 y=40（咬合门楼 massTop 44），
- * **不触地**（这正是旧 sink 按全足迹 6m 跨度反解、把唯一触地的门楼过度下沉的根因）。
- * 城堡唯一触地的是**门楼**（makeGate，±halfW 17.5 × depth 14）。
+ * 城堡取「门楼 + 翼墙」并集：
+ *   · 门楼（makeGate）±halfW 17.5 × depth 14 触地；
+ *   · 翼墙（castleKit `box('ashlar', w, h=29, d=8, …)`）**实际 y∈[0,29] 触地**（旧注释
+ *     「翼墙基座 y=40 不触地」是**误判**——那是钟楼 `clock.baseY=40`，不是翼墙），并
+ *     横向延伸至 ±WING_CROP_X(57)×scale（含端墙帽 56.5）⇒ 足迹 dl 必须扩到 ±57，
+ *     否则落在下坡侧的翼墙外端悬空（旧按门楼足迹反解，6/6 处悬空 0.43~1.98m）。
+ *   · ds 取门楼进深（14 > 翼墙 8，覆盖两者 + 基座 z 范围，避免基座前后沿漏采样）。
  * 主殿是整体落地（frontW 88 前段 + 两翼 ±105 都是 y 起 0 的墙），足迹取全立面 × 全进深；
  * yaw=π/2 ⇒ 立面(210)沿 s、进深(76)沿 lateral。
  */
@@ -266,7 +275,12 @@ function groundFootprintHalf(p: Placement): { ds: number; dl: number } {
   if (p.kind === 'hall') {
     return { ds: (MAIN_HALL.facadeW / 2) * p.scale, dl: (MAIN_HALL.depth / 2) * p.scale };
   }
-  // gate / castle：地面接触 = 门楼
+  if (p.kind === 'castle') {
+    // 城堡：地面接触 = 门楼（±17.5 × 14）+ 翼墙（y∈[0,29] 触地，横向 ±WING_CROP_X、进深 8）。
+    // dl 扩到 ±WING_CROP_X（覆盖翼墙外缘 55 + 端墙帽 56.5）；ds 取门楼进深（14 > 翼墙 8）。
+    return { ds: (GATE.depth / 2) * p.scale, dl: WING_CROP_X * p.scale };
+  }
+  // gate：地面接触 = 门楼
   return { ds: (GATE.depth / 2) * p.scale, dl: GATE.halfW * p.scale };
 }
 
@@ -525,8 +539,9 @@ export class Landmarks {
    *   · 底面 = 地形最低点之下 `margin` ⇒ 基座底埋进土里，任何角度不悬空；
    *   · 外扩 `outset`（比足迹略宽）⇒ 读作一圈可见石砌台基，兼防与墙底共面 z-fight。
    * 门楼（lateral 0）**不生成**：门洞跨路，基座会封死车道。
-   * 城堡的塔群翼墙（y=40 起、不触地）**不**纳入足迹 —— 那是旧 sink 按全足迹反解、
-   * 把门楼过度下沉的根因，本轮按地面接触足迹取。
+   * 城堡足迹 = 门楼 + 翼墙并集（翼墙 y∈[0,29] **触地**，横向 ±WING_CROP_X；旧注释
+   * 「翼墙 y=40 起不触地」是**误判**，那是钟楼 `clock.baseY=40`）。基座盒宽覆盖
+   * ±WING_CROP_X ⇒ 下坡侧翼墙外端也有一圈石砌台基/挡土墙承托，不再悬空。
    */
   private foundationBuckets(p: Placement): StoneBuckets {
     const b: StoneBuckets = { ashlar: [], wall: [], gold: [], dark: [], flame: [] };
@@ -544,8 +559,11 @@ export class Landmarks {
       const cz = MAIN_HALL.z - MAIN_HALL.depth / 2;
       b.ashlar.push(box('ashlar', w, depth, d, 0, -depth / 2, cz));
     } else {
-      // 城堡：地面接触 = 门楼（gate ±halfW × depth）。覆盖门楼足迹 + 外扩。
-      const w = GATE.halfW * 2 + o * 2;
+      // 城堡：地面接触 = 门楼 + 翼墙（横向 ±WING_CROP_X）。基座盒宽 = 2×WING_CROP_X
+      // （恰在裁剪面 ±57 内，覆盖翼墙端帽 56.5 余 0.5m；**不用 outset 外扩**——否则
+      // bbox 越 ±57 会被 `outsideCrop` 整件裁掉）⇒ 下坡侧翼墙外端由石砌台基/挡土墙承托
+      // （顶面随底座、底面埋入翼墙地形最低点之下）。
+      const w = WING_CROP_X * 2;
       const d = GATE.depth + o * 2;
       b.ashlar.push(box('ashlar', w, depth, d, 0, -depth / 2, GATE.z));
     }
@@ -603,7 +621,7 @@ export class Landmarks {
       pos.y += p.sink; // 门楼贴路面再微沉（塔墩埋进路肩外地形）
     } else {
       // 城堡/主殿：底座整体对齐**地面接触足迹**的地形高点（微嵌入 embed），
-      // 消除"插在地里"（旧 sink 按塔群全足迹 6m 跨度反解，把唯一触地的门楼过度下沉）。
+      // 消除"插在地里"（旧 sink 按塔群全足迹 6m 跨度反解，把触地的门楼/翼墙过度下沉）。
       // 下坡侧的高差由 `foundationBuckets` 的基座/挡土墙桥接（"轻微悬空" + 墙底过渡）。
       const half = groundFootprintHalf(p);
       const { max } = terrainSpanUnder(p, half);

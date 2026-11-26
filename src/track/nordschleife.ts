@@ -43,6 +43,9 @@ export interface TrackFrame {
 
 export const TRACK_LENGTH = 20831.6;
 
+/** Karussell（北环最急 RIGHT 弯）中心弧长 s（m）——混凝土 30° 内坡注入点（与 surface.gripAt 共享唯一真源） */
+export const KARUSSELL_S = 20675;
+
 /** 高程剖面：按弧长 s（米）与总长 L（米）返回世界 y 高程（米） */
 export type ElevationProfile = (s: number, L: number) => number;
 
@@ -315,7 +318,11 @@ export class Nordschleife {
       const w = smoothstep(0.006, 0.028, k);
       rawBank[i] = -Math.sign(curv[i]) * w * MAX_BANK;
     }
-    const BANK_SMOOTH = 2; // 每侧 2 点 → 5 点滑动平均
+    const BANK_SMOOTH = 8; // 每侧 8 点 → 17 点滑动平均（±32m 窗）
+    // V38 五点窗（±8m）对孤立尖峰残 ~1/5、对南环 20m 宽陡变区完全抹不平；
+    // 数值复查实测北环 0.538°、南环 1.044°（0.5m 步长）仍 >0.5° 可感知阈值。
+    // 17 点窗：北环孤立尖峰 0.538°→0.27°、南环闭合处 1.044°→0.44°（0.5m 步长）
+    // 与 1m 步长 0.452° 全步长稳健 <0.5° —— 海豚跳根治（子代理实测）。
     const bankSmooth = new Float64Array(count);
     for (let i = 0; i < count; i++) {
       let sum = 0;
@@ -324,8 +331,28 @@ export class Nordschleife {
       }
       bankSmooth[i] = sum / (2 * BANK_SMOOTH + 1);
     }
+
+    // Karussell：北环最急 RIGHT 弯（s≈20675，曲率峰 0.032 → 半径≈31m，单一方向）
+    // 注入 30° 混凝土内坡（AC 式 Karussell 机制：车"掉入"陡坡、g·sin(bank) 提供侧向支撑、
+    // surfaceHeight 经 right.y·lateral 天然读出"碗"面）。方向=现有 RIGHT 弯内倾（bank 正=右低）。
+    // 核心 s∈[20645,20705] 满 30°，两端 50m smoothstep 起落。结构性注入（平滑后叠加，不被防海豚跳抹平）。
+    const KARR = {
+      center: KARUSSELL_S,
+      halfCore: 30,
+      halfBlend: 50,
+      bank: (30 * Math.PI) / 180,
+      dir: +1 // RIGHT 弯 → +1（右低，与 rawBank sign 一致）
+    };
+    const karussellBank = (s: number): number => {
+      const d = Math.abs(s - KARR.center);
+      if (d <= KARR.halfCore) return KARR.dir * KARR.bank;
+      if (d <= KARR.halfCore + KARR.halfBlend) {
+        return KARR.dir * KARR.bank * (1 - smoothstep(KARR.halfCore, KARR.halfCore + KARR.halfBlend, d));
+      }
+      return 0;
+    };
     for (let i = 0; i < count; i++) {
-      const signed = bankSmooth[i];
+      const signed = bankSmooth[i] + karussellBank(i * this.spacing);
       bank[i] = signed;
       if (signed !== 0) {
         const c = Math.cos(signed);

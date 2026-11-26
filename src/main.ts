@@ -37,7 +37,8 @@ if (import.meta.env.DEV) {
     const waitReady = (): void => {
       const done = byId('loading').classList.contains('done');
       if (!done && performance.now() - begin < 20000) {
-        requestAnimationFrame(waitReady);
+        // 用 setTimeout 轮询而非 rAF：IAB/后台标签 rAF 被 Chromium 冻结时仍能触发自拍
+        window.setTimeout(waitReady, 250);
         return;
       }
       window.setTimeout(() => {
@@ -52,7 +53,7 @@ if (import.meta.env.DEV) {
         });
       }, 1200);
     };
-    requestAnimationFrame(waitReady);
+    window.setTimeout(waitReady, 250);
   }
 }
 

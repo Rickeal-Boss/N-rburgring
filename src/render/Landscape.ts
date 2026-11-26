@@ -267,7 +267,7 @@ export class Landscape {
         if (rockMix > 0) vc.lerp(ROCK_NORM, rockMix);
         // V2 近路鲜草：路肩外 8..24m 草色更鲜更密（只调色），24→60m 渐隐回常态。
         // V3：权重 0.55 → 0.50（微收敛，防鲜草带读作过饱和的亮绿，路肩/路面不受影响）。
-        const freshMix = sstep(6, 12, ax) * (1 - sstep(24, 40, ax));
+        const freshMix = sstep(9, 13, ax) * (1 - sstep(24, 40, ax));
         if (freshMix > 0) vc.lerp(FRESH_NORM, freshMix * 0.5);
         const o = idx * 3;
         col[o] = vc.r;

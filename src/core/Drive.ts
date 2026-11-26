@@ -17,7 +17,7 @@
  */
 import { BRAKE, DRIVE as DRIVE_POWER, GRAVITY, MS_TO_KMH, VEHICLE } from '../config/physics';
 import { getTrack } from '../track/nordschleife';
-import { surfaceHeight } from '../track/surface';
+import { surfaceHeight, gripAt } from '../track/surface';
 import { nextCornerAt } from '../track/cornerData';
 import { clamp, damp } from '../util/math';
 import { FREE_BODY_IMPACT_OSC } from '../config/freeBodyFeel';
@@ -112,7 +112,10 @@ export const DRIVE_MODEL = {
   /** 碰撞事件冷却 s（防 120Hz 每步触发） */
   impactCooldown: 0.35,
   /** 起步位置（起终线前 40m） */
-  startOffsetM: 40
+  startOffsetM: 40,
+  /** 飞坡落地冲击（AC 式）：腾空落地后侧向抓地瞬降的时长 s / 系数（落地后须稳住重心） */
+  landingGripTime: 0.25,
+  landingGripFactor: 0.8
 } as const;
 
 /** 驾驶输入（0..1 / −1..1） */
@@ -274,6 +277,13 @@ export class Drive {
   private impactRollOscVel = 0;
   private impactPitchOsc = 0;
   private impactPitchOscVel = 0;
+  /** 飞坡垂直动力学（AC 式）：垂直速度 m/s、腾空标志、上一帧表面高程、落地抓地恢复计时 s */
+  private vy = 0;
+  private airborne = false;
+  private lastSurfaceY = 0;
+  private landingTimer = 0;
+  /** 首帧表面初始化标志（防 lastSurfaceY=0 导致 vGround 爆掉误腾空） */
+  private surfaceInit = false;
   private impactCooldown = 0;
   private readonly telemetryObj: DriveTelemetry = {
     speedKmh: 0,
@@ -338,6 +348,11 @@ export class Drive {
     this.impactPitchOsc = 0;
     this.impactPitchOscVel = 0;
     this.impactCooldown = 0;
+    this.vy = 0;
+    this.airborne = false;
+    this.lastSurfaceY = 0;
+    this.landingTimer = 0;
+    this.surfaceInit = false;
     this.onBodyPose?.(0, 0);
   }
 
@@ -380,10 +395,18 @@ export class Drive {
     const shoulderFactor = onShoulder
       ? D.shoulderGrip - (D.shoulderGrip - D.gravelGripFloor) * clamp((latAbs - 8.4) / (10.1 - 8.4), 0, 1)
       : 1;
-    const mu = D.tyreMu * shoulderFactor;
+    const mu =
+      D.tyreMu *
+      shoulderFactor *
+      // V39 赛道局部抓地（AC 式材质 μ 分区：Karussell 混凝土 0.9 / 赛车线 1.02 / 修补面 ±3%）
+      gripAt(s, lateral) *
+      // 飞坡落地冲击：腾空落地后侧向抓地瞬降（0.25s 内 0.8×），落地后须稳住重心
+      (this.landingTimer > 0 ? D.landingGripFactor : 1);
     // V6 横倾（bank）内倾帮助过弯（AC 式「倾角」物理）：路面朝弯内倾斜，重力沿坡面
     // 产生向弯内分力 g·sin(|bank|)，净可用横向抓地 = mu·g·cos(bank) + g·sin(bank)。
-    // bank 生成规则「左弯左低」（nordschleife）⇒ 恒内倾 ⇒ 恒帮助（|bank|≤5.5° ⇒ +≤0.94 m/s²）。
+    // bank 生成规则「左弯左低」（nordschleife）⇒ 恒内倾 ⇒ 恒帮助。普通弯 |bank|≤5.5°
+    // （+≤0.94 m/s²）；V39 Karussell 混凝土内坡注入 30°（s≈20675）⇒ g·sin(30°)=4.9 m/s²
+    // 侧向支撑 —— 读作「掉入 Karussell 陡坡」的 AC 式拟真（车靠坡面过弯，抓地压力骤降）。
     // 直道/起点 bank≈0（实测 s=0..800 全 0.00°）⇒ 对转弯半径、yawRate、0-100 回归无影响。
     const bankAbs = Math.abs(bank);
     const gripLat = mu * GRAVITY * Math.cos(bankAbs) + GRAVITY * Math.sin(bankAbs);
@@ -512,9 +535,48 @@ export class Drive {
     lateral = (dx * f.right.x + dz * f.right.z) / rn2;
     st.s = s;
     st.lateral = lateral;
-    // V? 可驾驶表面高程（AC 式横剖面）：路面平面 + 路缘凸起 + 路肩/草地地形。
-    // 车贴着路面/路缘/路肩走 —— 压路缘真实「顶一下」、跑出路面随地形下沉（不再悬浮）。
-    st.y = surfaceHeight(s, lateral);
+    // V39 飞坡垂直动力学（AC 式）：坡顶 crest 腾空 / 自由落体 / 落地冲击。
+    // 原实现 st.y=surfaceHeight 每帧硬贴（车永不腾空）。真实北环 Flugplatz/Schwedenkreuz/
+    // Pflanzgarten 是标志性飞坡：过坡顶时表面骤降、车保留上坡垂直惯性 → 腾空（轮胎离地），
+    // 落地后侧向抓地瞬降（landingGrip），须稳住重心再转向 —— 读作「跳台」手感。
+    const surfaceY = surfaceHeight(s, lateral);
+    this.landingTimer = Math.max(0, this.landingTimer - dt);
+    if (!this.surfaceInit) {
+      // 首帧：直接贴地初始化（不计算 vGround，防 lastSurfaceY=0 爆掉）
+      st.y = surfaceY;
+      this.vy = 0;
+      this.lastSurfaceY = surfaceY;
+      this.surfaceInit = true;
+    } else {
+      this.vy -= GRAVITY * dt;
+      if (this.airborne) {
+        // 腾空：自由落体（重力已加）
+        st.y += this.vy * dt;
+        if (st.y <= surfaceY) {
+          // 落地：贴回表面，触发侧向抓地瞬降
+          st.y = surfaceY;
+          this.airborne = false;
+          this.vy = 0;
+          this.landingTimer = D.landingGripTime;
+        }
+      } else if (surfaceY >= st.y) {
+        // 贴地且表面抬升/持平：车被托上，记录向上垂直速度（上坡惯性，供过顶腾空）
+        const vGround = (surfaceY - this.lastSurfaceY) / dt;
+        st.y = surfaceY;
+        this.vy = Math.max(this.vy, vGround);
+      } else {
+        // 表面下降：车保留垂直惯性 —— 若仍在上抛（vy>0）则腾空，否则跟随缓坡
+        if (this.vy > 0.02) {
+          this.airborne = true;
+          st.y += this.vy * dt;
+        } else {
+          const vGround = (surfaceY - this.lastSurfaceY) / dt;
+          st.y = surfaceY;
+          this.vy = vGround;
+        }
+      }
+      this.lastSurfaceY = surfaceY;
+    }
 
     /* ── 8. 护栏碰撞（|lateral| > 10.6）：推回 + 切向保速 + 撞击回调 ──── */
     this.impactCooldown = Math.max(0, this.impactCooldown - dt);

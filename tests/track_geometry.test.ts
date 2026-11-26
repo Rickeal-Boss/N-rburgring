@@ -101,7 +101,11 @@ describe('track frames orthonormal', () => {
       expect(Math.hypot(u.x, u.y, u.z)).toBeCloseTo(1, 6);
       expect(Math.hypot(r.x, r.y, r.z)).toBeCloseTo(1, 6);
       // 坡度最大 18%，up.y 理论下限 ≈ cos(atan(0.18))=0.984；留 0.95 裕量
-      expect(u.y).toBeGreaterThan(0.95);
+      // V39 Karussell 30° 混凝土内坡（s≈20675，北环最急 RIGHT 弯）使 up 倾斜 ~33°
+      // （up.y=cos(33°)≈0.838）—— 这是设计意图（真实 Karussell 陡坡「掉入」），
+      // 非异常；其余段保持近垂直（≥0.95）。
+      const inKarr = s > 20540 && s < 20810;
+      expect(u.y).toBeGreaterThan(inKarr ? 0.83 : 0.95);
       const tr = t.x * r.x + t.y * r.y + t.z * r.z;
       expect(Math.abs(tr)).toBeLessThan(1e-3);
     }

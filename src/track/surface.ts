@@ -19,7 +19,7 @@
  *   |x| > 8.4       由路缘顶平滑过渡到地形高程（土路肩/草地，terrainHeight）
  *   —— 压路缘有真实「顶一下」、跑出路面车随地形下沉，不再悬浮。
  */
-import { getTrack, ROAD } from './nordschleife';
+import { getTrack, ROAD, KARUSSELL_S } from './nordschleife';
 
 /** 基准剖面（|x| → 相对路面中心的高差，m） */
 const PROFILE: readonly (readonly [number, number])[] = [
@@ -93,10 +93,11 @@ export function terrainHeight(s: number, lateral: number): number {
 
 /**
  * 白石路缘（真实凸起石条）顶面高度（m，相对路面平面）。
- * V38：0.10 → **0.20**（真实纽北路缘多段 >30cm，TCar/懂车帝/车质网多源实测；
- * 压上「过度弹跳导致失控」，读作 AC 式高路缘「顶一下」手感）。
+ * 数据深查（多源）：北环路缘缺乏标准化、实测 Flugplatz 出口约 12.7cm（本田翻车分析锚点）；
+ * 权威建议区间 0.10–0.15m。V38 曾按"用户假设 30cm"取 0.20，现按实测修正为 **0.15**（区间上限，
+ * 保留"路肩很凶、吃路肩弹跳"手感，Brünnchen 新路缘更硬更尖亦支持偏上限）。压上「过度弹跳」。
  */
-export const KERB_LIP = 0.2;
+export const KERB_LIP = 0.15;
 
 /** 路缘内缘 = 路面半宽（7m） */
 const KERB_INNER = ROAD.halfWidth;
@@ -131,4 +132,22 @@ export function surfaceHeight(s: number, lateral: number): number {
   const terr = terrainHeight(s, lateral);
   const blend = sstep(KERB_OUTER, KERB_OUTER + SHOULDER_BLEND, ax);
   return kerbTop + (terr - kerbTop) * blend;
+}
+
+/**
+ * 赛道局部抓地乘数（AC 式材质 μ 分区 + 赛车线 + 修补面差异）。
+ * 返回乘数（基 1.0 = 干燥沥青），Drive 的 μ = tyreMu·shoulderFactor·gripAt(s,lat)。
+ *
+ * · Karussell 混凝土内坡（s≈20675）：μ 降 10%（混凝土干 0.5-0.7 < 沥青 0.6-0.8，数据深查），
+ *   渐变 60→80m 防跳变；
+ * · 赛车线橡胶积碳带（|lat|<2.6）：μ +2%（光头胎压积碳线抓地略升，AC 式 racing line）；
+ * · 修补面/新旧沥青差异：沿 s 低频空间噪声 ±3%（老旧翻新段 μ 有差异）。
+ * 路肩/草地降抓地由 Drive 的 shoulderFactor 处理，此处只管路面局部 μ。
+ */
+export function gripAt(s: number, lateral: number): number {
+  const dK = Math.abs(s - KARUSSELL_S);
+  const karr = dK <= 80 ? 1 - 0.1 * (1 - sstep(60, 80, dK)) : 1;
+  const racingLine = Math.abs(lateral) < 2.6 ? 1.02 : 1;
+  const patch = 1 + 0.03 * Math.sin(s * 0.013 + 2.2) * Math.sin(s * 0.0061 + 0.7);
+  return karr * racingLine * patch;
 }
