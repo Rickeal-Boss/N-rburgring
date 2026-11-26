@@ -17,6 +17,7 @@
  */
 import { BRAKE, DRIVE as DRIVE_POWER, GRAVITY, MS_TO_KMH, VEHICLE } from '../config/physics';
 import { getTrack } from '../track/nordschleife';
+import { surfaceHeight } from '../track/surface';
 import { nextCornerAt } from '../track/cornerData';
 import { clamp, damp } from '../util/math';
 import { FREE_BODY_IMPACT_OSC } from '../config/freeBodyFeel';
@@ -511,7 +512,9 @@ export class Drive {
     lateral = (dx * f.right.x + dz * f.right.z) / rn2;
     st.s = s;
     st.lateral = lateral;
-    st.y = f.center.y + f.right.y * lateral;
+    // V? 可驾驶表面高程（AC 式横剖面）：路面平面 + 路缘凸起 + 路肩/草地地形。
+    // 车贴着路面/路缘/路肩走 —— 压路缘真实「顶一下」、跑出路面随地形下沉（不再悬浮）。
+    st.y = surfaceHeight(s, lateral);
 
     /* ── 8. 护栏碰撞（|lateral| > 10.6）：推回 + 切向保速 + 撞击回调 ──── */
     this.impactCooldown = Math.max(0, this.impactCooldown - dt);
@@ -520,7 +523,7 @@ export class Drive {
       const lat = sign * D.railLimit;
       st.x = f.center.x + f.right.x * lat;
       st.z = f.center.z + f.right.z * lat;
-      st.y = f.center.y + f.right.y * lat;
+      st.y = surfaceHeight(s, lat);
       st.lateral = lat;
       st.slip *= 0.5;
       if (this.impactCooldown <= 0 && av > 1.2) {

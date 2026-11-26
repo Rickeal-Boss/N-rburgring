@@ -17,6 +17,7 @@
  */
 import * as THREE from 'three';
 import { getTrack, getCurrentMode, selectApexes } from '../track/nordschleife';
+import { KERB_LIP } from '../track/surface';
 import { mergeSafe } from '../util/geo';
 import { makeLcg } from '../util/math';
 import { canvasTexture, makeCanvas, textTexture } from '../util/canvasTex';
@@ -701,16 +702,34 @@ export class Track {
     road.receiveShadow = true;
     this.group.add(road);
 
-    /* ── 白石路缘（|x| ∈ [7, 8.4]，抬高 0.03）──────────────────────────
-     * V2：红白交替贴图（色已烘焙进 kerbTexture，材质色改纯白避免二次调色）。 */
+    /* ── 白石路缘（|x| ∈ [7, 8.4]，真实凸起石条 KERB_LIP=0.10）────────────
+     * V2 红白交替贴图（色已烘焙进 kerbTexture，材质色纯白）。
+     * 剖面（与 track/surface.surfaceHeight 的 KERB_LIP 同源）：内缘起坡 0→KERB_LIP、
+     * 平台、外缘落坡 KERB_LIP→−0.02（接土路肩内缘）—— 压上「顶一下」读作真石条。
+     * DoubleSide：侧面（内外立面）从任何角度可见。 */
     const kerbTex = kerbTexture();
     this.textures.push(kerbTex);
-    const kerbMat = new THREE.MeshStandardMaterial({ color: 0xffffff, roughness: 0.8, map: kerbTex });
+    const kerbMat = new THREE.MeshStandardMaterial({
+      color: 0xffffff,
+      roughness: 0.8,
+      map: kerbTex,
+      side: THREE.DoubleSide
+    });
     this.materials.push(kerbMat);
-    const kerbGeo = mergeSafe([
-      buildRibbon(strip(-8.4, 0.03, -7, 0.03), 4, 4),
-      buildRibbon(strip(7, 0.03, 8.4, 0.03), 4, 4)
-    ]);
+    // 左右路缘：4 列剖面（内缘底→内缘顶→外缘顶→外缘底），u 沿宽向 0→1。
+    const kerbColsL: Column[] = [
+      { x: -7, y: 0, u: 0 },
+      { x: -7, y: KERB_LIP, u: 0.34 },
+      { x: -8.4, y: KERB_LIP, u: 0.67 },
+      { x: -8.4, y: -0.02, u: 1 }
+    ];
+    const kerbColsR: Column[] = [
+      { x: 7, y: 0, u: 0 },
+      { x: 7, y: KERB_LIP, u: 0.34 },
+      { x: 8.4, y: KERB_LIP, u: 0.67 },
+      { x: 8.4, y: -0.02, u: 1 }
+    ];
+    const kerbGeo = mergeSafe([buildRibbon(kerbColsL, 4, 4), buildRibbon(kerbColsR, 4, 4)]);
     this.geometries.push(kerbGeo);
     const kerb = new THREE.Mesh(kerbGeo, kerbMat);
     kerb.name = 'kerb';
@@ -742,8 +761,9 @@ export class Track {
      * 横梁：x=±11.2 的**双梁**竖直薄带 —— 下梁 y 0.43~0.53、上梁 y 0.73~0.83
      *   （各 0.10 厚，中心 0.48 / 0.78），DoubleSide 单面片，合并成 1 个 mesh（1 DC）。
      * 立柱：每 **5m** 一根，坐落在土路肩（11.2 处 ≈ −0.31）上、顶端探到上梁上沿 ——
-     *   箱体 0.16×1.32×0.16（地上 1.16 到 y=0.85 + 地下 0.16 埋入路肩），中心取
-     *   local y = 0.19 ⇒ 底 −0.47 / 顶 0.85，上下梁（0.43~0.83）均被立柱贯穿搭接。 */
+     *   箱体 0.16×1.32×0.16，底沿可见路肩表面（shoulderY 剖面）固定埋入 0.15m、
+     *   顶探出上梁（上下梁 0.43~0.83 均被立柱贯穿搭接）。立柱竖直（绕 Y），中心取
+     *   路肩表面 +（半高 0.66 − 埋深 0.15），斜坡上不再随 f.up 漂移 ⇒ 不悬空/不深插。 */
     const railMat = new THREE.MeshStandardMaterial({
       color: RAIL_GREY,
       roughness: 0.55,
@@ -783,10 +803,16 @@ export class Track {
       const heading = Math.atan2(f.tangent.x, f.tangent.z);
       q.setFromAxisAngle(up, heading);
       for (const side of [-1, 1]) {
+        // 立柱竖直（q 只绕 Y 旋转 ⇒ 局部 Y = 世界 Y），原中心沿 f.up 偏移 0.19 在斜坡处
+        // 使立柱底随 f.up.y 波动 + f.up 横向分量漂移 ⇒ 插入路肩下草地或悬空。
+        // 改为底贴可见路肩表面（shoulderY 剖面，与 buildRibbon 路肩 ribbon 同源），固定埋入：
+        //   路肩表面 Y = center.y + right.y·(side·11.2) + up.y·shoulderY(11.2)
+        //   立柱中心 Y = 表面Y + (半高 1.32/2 − 埋深 0.15)，横向不再叠加 f.up 漂移。
+        const surfY = f.center.y + f.right.y * side * 11.2 + f.up.y * shoulderY(11.2);
         p.set(
-          f.center.x + f.right.x * side * 11.2 + f.up.x * 0.19,
-          f.center.y + f.right.y * side * 11.2 + f.up.y * 0.19,
-          f.center.z + f.right.z * side * 11.2 + f.up.z * 0.19
+          f.center.x + f.right.x * side * 11.2,
+          surfY + (0.66 - 0.15),
+          f.center.z + f.right.z * side * 11.2
         );
         m.compose(p, q, one);
         posts.setMatrixAt(idx++, m);

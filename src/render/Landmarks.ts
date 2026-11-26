@@ -50,7 +50,7 @@
 import * as THREE from 'three';
 import { getTrack, type TrackMode } from '../track/nordschleife';
 import { mergeSafe } from '../util/geo';
-import { terrainPoint } from './Landscape';
+import { terrainPoint, terrainY } from './Landscape';
 import { createAshlarTexture } from './scene/ashlarTexture';
 import { box, makeGate, makeMainHall, makeTowerGroup, setDetailLevel } from './scene/castleKit';
 import type { StoneBuckets } from './scene/castleKit';
@@ -117,7 +117,14 @@ export interface Placement {
   scale: number;
   /** 帧之后绕局部 Y 的额外偏转（rad）；0 = 建筑前脸朝来车（旧仓 applyFrame 语义） */
   yaw: number;
-  /** 底面再下沉量（m，负值把台基埋进地形，避免斜坡上悬空） */
+  /**
+   * 底面再下沉量（m）。**只对门楼（kind 'gate'）生效**：门洞跨路、底面取路面
+   * （frame.center），负值把塔墩埋进路肩外地形。
+   * ⚠ 城堡/主殿（kind 'castle'/'hall'）**忽略本值**：底座由 `frameMatrix` 按
+   * `terrainSpanUnder` 对齐地面接触足迹的地形高点（`FOUNDATION.embed`），
+   * 下坡侧高差由 `foundationBuckets` 的基座/挡土墙桥接 —— 旧 sink 按塔群全足迹
+   * 6m 跨度反解，会把唯一触地的门楼过度下沉（"插在地里"），故不再使用。
+   */
   sink: number;
   /** 是否投影（只有近景大门给 true；远景件投影只白烧 shadow pass） */
   castShadow: boolean;
@@ -213,6 +220,73 @@ function placementsFor(mode: TrackMode): readonly Placement[] {
  * ⚠ 主殿**不得**套用（立面设计宽就是 210m）。
  */
 const WING_CROP_X = 57;
+
+/* ═══════════════════ 基座/挡土墙（C4：贴地修复） ═══════════════════ */
+
+/**
+ * 城堡/主殿的石砌基座（= 挡土墙 + 台基）参数。
+ *
+ * 根因（像素级 QA 南环 s=2145/4560/7360 等）：flat 底座的建筑落在横坡/爬坡上，
+ * 底座只按「足迹最低点触地」反解 sink ⇒ 上坡侧整栋埋进山体（"插在地里"）、
+ * 下坡侧靠 hf 微起伏出现缝隙（"轻微悬空"），且墙底直接切草地、无基座过渡。
+ * 南环主殿（s=4708）最重：210m 立面沿爬坡铺开，足迹地形跨度 9.0m ⇒
+ * 低端悬空 2.96m、高端埋 6.07m（probe 实测）。
+ *
+ * 修法（只在本文件，零 DC / 12 tri/座）：
+ *   ① 底座整体 Y 对齐**地面接触足迹**的地形**高点**（`terrainSpanUnder` 探针）——
+ *      消除"插在地里"（不再整栋埋进山体，只微嵌入 `embed`）；
+ *   ② 底座下加一圈**石砌基座/挡土墙**（`foundationBuckets`），顶面随底座、向下
+ *      深到地形**低点**之下 `margin` —— 消除"轻微悬空"，并给出墙底→草地的
+ *      "地基/挡土墙过渡"。
+ * 基座深随地形自反解（`terrainSpanUnder` 是唯一真源，与地形网格同源），
+ * 不写死 —— 换赛道/改摆位都自动贴合地面。
+ *
+ * ⚠ 基座是**纯盒体**（12 tri），只作用于非门（城堡/主殿）；门楼跨路（lateral 0）
+ * 底面本就在路面（frame.center），不需要也**不能**加（会封死车道）。
+ */
+const FOUNDATION = {
+  /** 底座顶嵌入地形高点的量（m，世界系）：建筑轻微"坐"进土里，不留缝 */
+  embed: 0.5,
+  /** 基座底再低于地形最低点的余量（m）：保证基座底埋进土里、任何角度不悬空 */
+  margin: 1.0,
+  /** 基座外扩（m，局部系，随 scale 缩放）：比足迹略宽，读作一圈可见石砌台基 */
+  outset: 0.6
+} as const;
+
+/**
+ * 建筑**地面接触足迹**的半幅（沿 s / 沿 lateral，m，世界系）——基座和地形探针都用它。
+ *
+ * ⚠ 城堡**不能**用塔群全宽：`makeTowerGroup` 的翼墙基座 y=40（咬合门楼 massTop 44），
+ * **不触地**（这正是旧 sink 按全足迹 6m 跨度反解、把唯一触地的门楼过度下沉的根因）。
+ * 城堡唯一触地的是**门楼**（makeGate，±halfW 17.5 × depth 14）。
+ * 主殿是整体落地（frontW 88 前段 + 两翼 ±105 都是 y 起 0 的墙），足迹取全立面 × 全进深；
+ * yaw=π/2 ⇒ 立面(210)沿 s、进深(76)沿 lateral。
+ */
+function groundFootprintHalf(p: Placement): { ds: number; dl: number } {
+  if (p.kind === 'hall') {
+    return { ds: (MAIN_HALL.facadeW / 2) * p.scale, dl: (MAIN_HALL.depth / 2) * p.scale };
+  }
+  // gate / castle：地面接触 = 门楼
+  return { ds: (GATE.depth / 2) * p.scale, dl: GATE.halfW * p.scale };
+}
+
+/** 足迹下方地形高程 min/max（与地形网格同源的 17×17 探针，构建期一次，代价可忽略） */
+function terrainSpanUnder(
+  p: Placement,
+  half: { ds: number; dl: number }
+): { min: number; max: number } {
+  const N = 8;
+  let min = Infinity;
+  let max = -Infinity;
+  for (let i = -N; i <= N; i += 1) {
+    for (let j = -N; j <= N; j += 1) {
+      const y = terrainY(p.s + (i / N) * half.ds, p.lateral + (j / N) * half.dl);
+      if (y < min) min = y;
+      if (y > max) max = y;
+    }
+  }
+  return { min, max };
+}
 
 /* ═══════════════════ C 阶段 · 主殿立面细节（C1） ═══════════════════ */
 
@@ -344,6 +418,13 @@ export class Landmarks {
       }
     }
 
+    // C4：城堡/主殿贴地基座（石砌台基/挡土墙）——门楼跨路不加（会封死车道）。
+    // 在 maker 产出坐标系（地面 y=0）生成，走同一套归一化 + 帧矩阵 ⇒ 并入 ashlar-far
+    // （**+0 DC**，每座 12 tri）。
+    if (p.kind !== 'gate') {
+      builders.push(this.foundationBuckets(p));
+    }
+
     // 局部原点 = 建筑中心（x 已对称）。y 不归一：三个 maker 的「地面」都正好 y=0
     const zAnchor = p.kind === 'hall' ? MAIN_HALL.z : GATE.z;
     const m = this.frameMatrix(p).multiply(new THREE.Matrix4().makeTranslation(0, 0, -zAnchor));
@@ -435,6 +516,42 @@ export class Landmarks {
     return b;
   }
 
+  /**
+   * C4 城堡/主殿贴地基座（石砌台基 + 挡土墙）——在 maker 产出坐标系（地面 y=0）生成，
+   * 走 `buildPlacement` 的归一化 + 帧矩阵，并入 ashlar-far mesh（**+0 DC**，12 tri）。
+   *
+   * 尺寸按 `groundFootprintHalf`（地面接触足迹）取，深随地形自反解：
+   *   · 顶面 = 底座（y=0，`frameMatrix` 已把底座对齐足迹地形高点 − embed）；
+   *   · 底面 = 地形最低点之下 `margin` ⇒ 基座底埋进土里，任何角度不悬空；
+   *   · 外扩 `outset`（比足迹略宽）⇒ 读作一圈可见石砌台基，兼防与墙底共面 z-fight。
+   * 门楼（lateral 0）**不生成**：门洞跨路，基座会封死车道。
+   * 城堡的塔群翼墙（y=40 起、不触地）**不**纳入足迹 —— 那是旧 sink 按全足迹反解、
+   * 把门楼过度下沉的根因，本轮按地面接触足迹取。
+   */
+  private foundationBuckets(p: Placement): StoneBuckets {
+    const b: StoneBuckets = { ashlar: [], wall: [], gold: [], dark: [], flame: [] };
+    const half = groundFootprintHalf(p);
+    const { min, max } = terrainSpanUnder(p, half);
+    // 基座深（世界系）= 地形高点→低点 + 顶面嵌入 + 底面埋入余量；随 scale 换算到局部系
+    const depthWorld = max - min + FOUNDATION.embed + FOUNDATION.margin;
+    const depth = depthWorld / p.scale;
+    const o = FOUNDATION.outset;
+
+    if (p.kind === 'hall') {
+      // 主殿：前脸 z=MAIN_HALL.z（归一后 0），进深向 −z。覆盖全立面 × 全进深 + 外扩。
+      const w = MAIN_HALL.facadeW + o * 2;
+      const d = MAIN_HALL.depth + o * 2;
+      const cz = MAIN_HALL.z - MAIN_HALL.depth / 2;
+      b.ashlar.push(box('ashlar', w, depth, d, 0, -depth / 2, cz));
+    } else {
+      // 城堡：地面接触 = 门楼（gate ±halfW × depth）。覆盖门楼足迹 + 外扩。
+      const w = GATE.halfW * 2 + o * 2;
+      const d = GATE.depth + o * 2;
+      b.ashlar.push(box('ashlar', w, depth, d, 0, -depth / 2, GATE.z));
+    }
+    return b;
+  }
+
   /** 越界件判定（见 `WING_CROP_X`）：整件丢弃，不按顶点裁 */
   private outsideCrop(g: THREE.BufferGeometry): boolean {
     g.computeBoundingBox();
@@ -483,10 +600,16 @@ export class Landmarks {
         f.center.y,
         f.center.z + rightH.z * p.lateral
       );
+      pos.y += p.sink; // 门楼贴路面再微沉（塔墩埋进路肩外地形）
     } else {
-      terrainPoint(p.s, p.lateral, pos);
+      // 城堡/主殿：底座整体对齐**地面接触足迹**的地形高点（微嵌入 embed），
+      // 消除"插在地里"（旧 sink 按塔群全足迹 6m 跨度反解，把唯一触地的门楼过度下沉）。
+      // 下坡侧的高差由 `foundationBuckets` 的基座/挡土墙桥接（"轻微悬空" + 墙底过渡）。
+      const half = groundFootprintHalf(p);
+      const { max } = terrainSpanUnder(p, half);
+      terrainPoint(p.s, p.lateral, pos); // 只取 x/z
+      pos.y = max - FOUNDATION.embed;
     }
-    pos.y += p.sink;
 
     return new THREE.Matrix4().compose(pos, q, new THREE.Vector3(p.scale, p.scale, p.scale));
   }

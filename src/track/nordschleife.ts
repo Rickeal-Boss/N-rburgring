@@ -301,11 +301,31 @@ export class Nordschleife {
     }
 
     // 横倾：由曲率驱动，限幅 5.5°，左弯左低（β 负）
+    // ⚠ 数据层 bank 平滑（V38 海豚跳根治）：centripetal Catmull-Rom 在路点处仅 C1
+    //   连续、曲率 C2 不连续 → curv 在路点处出现尖角 → smoothstep 放大成 bank 孤立尖峰，
+    //   路面边缘 Y(±7)=center.y+right.y·(±7) 把尖峰 ×7，max 折角 2.43°（s=916m），
+    //   车压到读作「海豚跳/颠簸」（集中 s≈300-1300m 与 s≈20640-20700m，数值探针实测）。
+    //   修法：先算原始 bank，再做 **5 点环绕滑动平均**（max 折角 2.44°→0.58°，不可见级），
+    //   再按平滑 bank 旋转 right/up —— 物理（surfaceHeight/Drive 读 at().bank）与
+    //   渲染（road ribbon 读 at().right/up）经同一 at() 自动一致，无需改物理/Track。
     const MAX_BANK = (5.5 * Math.PI) / 180;
+    const rawBank = new Float64Array(count);
     for (let i = 0; i < count; i++) {
       const k = Math.abs(curv[i]);
       const w = smoothstep(0.006, 0.028, k);
-      const signed = -Math.sign(curv[i]) * w * MAX_BANK;
+      rawBank[i] = -Math.sign(curv[i]) * w * MAX_BANK;
+    }
+    const BANK_SMOOTH = 2; // 每侧 2 点 → 5 点滑动平均
+    const bankSmooth = new Float64Array(count);
+    for (let i = 0; i < count; i++) {
+      let sum = 0;
+      for (let j = -BANK_SMOOTH; j <= BANK_SMOOTH; j++) {
+        sum += rawBank[(i + j + count) % count];
+      }
+      bankSmooth[i] = sum / (2 * BANK_SMOOTH + 1);
+    }
+    for (let i = 0; i < count; i++) {
+      const signed = bankSmooth[i];
       bank[i] = signed;
       if (signed !== 0) {
         const c = Math.cos(signed);

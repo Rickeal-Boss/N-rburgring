@@ -25,42 +25,13 @@
  */
 import * as THREE from 'three';
 import { getTrack } from '../track/nordschleife';
+import { terrainHeight } from '../track/surface';
 import { canvasTexture, makeCanvas } from '../util/canvasTex';
 import { makeLcg } from '../util/math';
 
 /** 横向列（对称，从最左到最右） */
 const COLUMNS: readonly number[] = [
   -1400, -800, -420, -220, -120, -60, -24, -8, 8, 24, 60, 120, 220, 420, 800, 1400
-];
-
-/** 基准剖面（|x| → 相对路面中心的高差） */
-const PROFILE: readonly (readonly [number, number])[] = [
-  [8, -0.38],
-  [24, -0.45],
-  [60, -1.2],
-  [120, -2.2],
-  [220, -3.6],
-  [420, -7.0],
-  [800, -18],
-  [1400, -40]
-];
-
-/**
- * 低频起伏包络（|x| → 振幅 m；列宽外的区间平滑插值）。
- * spec A2：中/远场滚动加大 —— 60m 起就有 0.8m 呼吸感，120~420m 抬到 4~10m
- * （可见近丘），800/1400m 抬到 14/18m —— 1400m 列本身在 −40m，加起伏后仍全在
- * 路面之下，但能把「一刀切的地平线」变成起伏山脊。
- * ⚠ 铁律：|x|≤24m 起伏恒 0（不顶穿路肩/路面），24→60m 渐入 —— 在 `terrainPoint`
- *   里用 smoothstep(24,60,|x|) 门控，`tableAt` 在 x≤60 会返回 0.8 只是「包络」，
- *   真正生效的振幅还要乘门控（见下）。
- */
-const NOISE_AMP: readonly (readonly [number, number])[] = [
-  [60, 0.8],
-  [120, 4.0],
-  [220, 7.5],
-  [420, 10],
-  [800, 14],
-  [1400, 18]
 ];
 
 /** 平滑阶跃：x 在 [edge0,edge1] 内 0→1，边缘外钳制（列间曲率连续） */
@@ -129,62 +100,27 @@ function sampleVertexColor(x: number, z: number, rnd: () => number, out: THREE.C
   return out.multiplyScalar(j);
 }
 
-function tableAt(table: readonly (readonly [number, number])[], x: number): number {
-  if (x <= table[0][0]) return table[0][1];
-  const last = table[table.length - 1];
-  if (x >= last[0]) return last[1];
-  for (let i = 1; i < table.length; i++) {
-    const a = table[i - 1];
-    const b = table[i];
-    if (x <= b[0]) {
-      const t = (x - a[0]) / (b[0] - a[0]);
-      // smoothstep：列间曲率连续，避免折线状山脊
-      return a[1] + (b[1] - a[1]) * (t * t * (3 - 2 * t));
-    }
-  }
-  return last[1];
-}
-
-const TAU = Math.PI * 2;
-
 /**
  * 弧长 s + 横向 lateral → 地形世界坐标（与地形网格顶点**同源**）。
- * 横向位置用水平右向（不含 bank），高程 = 中心高程 + bank 近场跟随 + 剖面 + 低频起伏。
+ * 横向位置用水平右向（不含 bank），高程 = `terrainHeight`（本文件唯一真源，见 track/surface）。
  */
 export function terrainPoint(s: number, lateral: number, out: THREE.Vector3): THREE.Vector3 {
   const track = getTrack();
   const f = track.at(s);
-  const L = track.length;
   const rl = Math.hypot(f.tangent.x, f.tangent.z) || 1;
   const rhx = f.tangent.z / rl;
   const rhz = -f.tangent.x / rl;
-  const ax = Math.abs(lateral);
-  const bankFade = ax <= 24 ? 1 : Math.max(0, 1 - (ax - 24) / 36);
-  const bankY = f.right.y * lateral * bankFade;
-  // 主低频起伏（包络 × 门控）：铁律 |x|≤24 恒 0，24→60m 平滑渐入（防顶穿路肩/路面）
-  const amp = tableAt(NOISE_AMP, ax) * sstep(24, 60, ax);
-  const phase = lateral < 0 ? 2.1 : 0;
-  const n1 = Math.sin((s / L) * TAU * 7 + 1.7);
-  const n2 = Math.sin((s / L) * TAU * 23 + 0.4);
-  const bumps = amp * (n1 * Math.cos(lateral * 0.004 + phase) * 0.6 + n2 * Math.sin(lateral * 0.006 + phase) * 0.4);
-  // 近中场地表高频小起伏（~35m 波长，±0.6m）：只作用于 |x|>40m，smoothstep(40,80) 渐入，
-  // 给 60~300m 近中场草甸「呼吸感」（spec A2）。波长 2π/0.18≈35m、2π/0.12≈52m。
-  const hfAmp = 0.6 * sstep(40, 80, ax);
-  const hf =
-    hfAmp *
-    (Math.sin(s * 0.18 + lateral * 0.09 + 1.2) * 0.7 + Math.sin(s * 0.12 + lateral * 0.15 + 4.4) * 0.3);
   out.set(
     f.center.x + rhx * lateral,
-    f.center.y + bankY + tableAt(PROFILE, ax) + bumps + hf,
+    terrainHeight(s, lateral),
     f.center.z + rhz * lateral
   );
   return out;
 }
 
-/** 仅取高程（落地用；比 terrainPoint 少写两个分量，语义相同） */
-const SCRATCH = new THREE.Vector3();
+/** 仅取高程（落地用；与 terrainPoint 同语义，直接委托 surface 真源） */
 export function terrainY(s: number, lateral: number): number {
-  return terrainPoint(s, lateral, SCRATCH).y;
+  return terrainHeight(s, lateral);
 }
 
 /** 草地/泥土混合贴图（1024²，偏灰绿；spec A1：升 1024、加大块低频色斑、UV 世界尺度 40m） */
