@@ -804,7 +804,7 @@ export class Scenery {
   ): void {
     const track = getTrack();
     for (let k = 0; k < 3; k++) {
-      ruinParts.push(paintGeo(boxAt(2.0, 1.0 * (k + 1), 16, sCenter, 18 + k * 2.0, 0), 1, 1, 1));
+      ruinParts.push(paintGeo(boxAt(2.0, 1.0 * (k + 1), 28, sCenter, 18 + k * 2.0, 0), 1, 1, 1));
     }
     const railX = 16.2; // 看台首级前缘（lateral 18−1=17）再朝赛道收 0.8m
     for (const ps of [sCenter - 14, sCenter, sCenter + 14]) {

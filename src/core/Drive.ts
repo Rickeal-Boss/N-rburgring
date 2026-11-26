@@ -403,13 +403,15 @@ export class Drive {
       // 飞坡落地冲击：腾空落地后侧向抓地瞬降（0.25s 内 0.8×），落地后须稳住重心
       (this.landingTimer > 0 ? D.landingGripFactor : 1);
     // V6 横倾（bank）内倾帮助过弯（AC 式「倾角」物理）：路面朝弯内倾斜，重力沿坡面
-    // 产生向弯内分力 g·sin(|bank|)，净可用横向抓地 = mu·g·cos(bank) + g·sin(bank)。
-    // bank 生成规则「左弯左低」（nordschleife）⇒ 恒内倾 ⇒ 恒帮助。普通弯 |bank|≤5.5°
-    // （+≤0.94 m/s²）；V39 Karussell 混凝土内坡注入 30°（s≈20675）⇒ g·sin(30°)=4.9 m/s²
-    // 侧向支撑 —— 读作「掉入 Karussell 陡坡」的 AC 式拟真（车靠坡面过弯，抓地压力骤降）。
-    // 直道/起点 bank≈0（实测 s=0..800 全 0.00°）⇒ 对转弯半径、yawRate、0-100 回归无影响。
+    // 产生向弯内分力 g·sin(|bank|)，净可用横向抓地 = mu·g·cos(bank) + help·g·sin(bank)。
+    // help = −sign(curv)·sign(bank)：内倾（sign 相反）⇒ help=+1 恒帮助（普通弯 |bank|≤5.5°，
+    // +≤0.94 m/s²）；**V40 off-camber（反倾斜）注入段 sign 相同 ⇒ help=−1 恒减抓地**
+    // （读作「反斜易滑/转向过度」——纽北 Hocheichen/Eschbach/Pflanzgarten/Brünnchen 标志）。
+    // V39 Karussell 混凝土内坡 30°（s≈20675，内倾）⇒ help=+1，g·sin(30°)=4.9 m/s² 侧向支撑
+    // （掉入陡坡 AC 式拟真）。直道/起点 bank≈0 ⇒ help 项为 0，对 0-100/转弯半径回归无影响。
     const bankAbs = Math.abs(bank);
-    const gripLat = mu * GRAVITY * Math.cos(bankAbs) + GRAVITY * Math.sin(bankAbs);
+    const help = bankAbs > 1e-6 && (f.curvature ?? 0) !== 0 ? -Math.sign(f.curvature ?? 0) * Math.sign(bank) : 0;
+    const gripLat = mu * GRAVITY * Math.cos(bankAbs) + help * GRAVITY * Math.sin(bankAbs);
     // 路肩破坏动态 V2 —— 报告：路肩普遍高而凸，压上破坏动态强（比 V1 更真实）。
     // 分带（|lateral|）：
     //   路缘凸起（curb lip） 7.5~8.8 —— 高而凸，压上「顶一下」，向内推很强（×1.6）；

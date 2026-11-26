@@ -19,7 +19,7 @@
  * 构造器消费（构造器内部用 ROAD.sampleSpacing 采样）。
  */
 
-import { Nordschleife } from './nordschleife';
+import { Nordschleife, SUED_OFF_CAMBER } from './nordschleife';
 import type { ElevationProfile } from './nordschleife';
 
 /** 南环官方长度（≈7.7 km） */
@@ -73,12 +73,15 @@ export const suedElevationRaw: ElevationProfile = (s, L) => {
   y -= 12 * bumpAt(s, L * 0.30, 500); // 陡降穿桥（Müllenbach 前下坡）
   y += 26 * bumpAt(s, L * 0.62, 750); // 长爬坡高点
   y += 5 * bumpAt(s, L * 0.88, 300); // 收尾缓坡
+  // ── 南环飞坡 crest（几何定位：长爬坡顶 s≈0.62L 起坡/下坡折点，V40 新增）──
+  y += 4 * bumpAt(s, L * 0.40, 260); // 下坡后回弹 crest
+  y += 5 * bumpAt(s, L * 0.70, 280); // 爬坡顶后 crest（>100km/h 可微离地）
   return y;
 };
 
-/** 构建南环赛道实例（复用北环 Nordschleife 类，传南环路点/长度/高程） */
+/** 构建南环赛道实例（复用北环 Nordschleife 类，传南环路点/长度/高程/off-camber 表） */
 export function newSuedschleife(): Nordschleife {
-  return new Nordschleife(SUED_WAYPOINTS, SUED_TRACK_LENGTH, suedElevationRaw);
+  return new Nordschleife(SUED_WAYPOINTS, SUED_TRACK_LENGTH, suedElevationRaw, SUED_OFF_CAMBER);
 }
 
 // 复用北环路面几何参数（不重复定义）；南环构建经 Nordschleife 构造器消费 ROAD。

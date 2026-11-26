@@ -46,6 +46,31 @@ export const TRACK_LENGTH = 20831.6;
 /** Karussell（北环最急 RIGHT 弯）中心弧长 s（m）——混凝土 30° 内坡注入点（与 surface.gripAt 共享唯一真源） */
 export const KARUSSELL_S = 20675;
 
+/**
+ * Off-camber（反倾斜）注入表 —— 纽北标志特征：高速弯**外侧低**（离心方向倾斜），
+ * g·sin(bank) 转为**负**（减横向抓地），读作「反斜易滑/转向过度」。
+ * 真实 Hocheichen/Eschbach/Pflanzgarten/Brünnchen 反斜 → 几何代理（半径>60m 中高速弯，
+ * 数值定位 R3）。符号约定与 rawBank 同号：右弯(外低=左低)→负，左弯(外低=右低)→正。
+ * 表项 [s_center, target(rad), halfWidth]。
+ */
+export const NORTH_OFF_CAMBER: ReadonlyArray<readonly [number, number, number]> = [
+  [160, -(1.5 * Math.PI) / 180, 60],
+  [304, +(1.5 * Math.PI) / 180, 55],
+  [1064, -(1.5 * Math.PI) / 180, 55],
+  [1240, +(1.5 * Math.PI) / 180, 55],
+  [1408, -(1.5 * Math.PI) / 180, 55],
+  [1564, +(1.5 * Math.PI) / 180, 55],
+  [5868, -(1.5 * Math.PI) / 180, 60]
+];
+
+/** 南环 off-camber（均为左弯→右低正号；半径 65-89m，数值定位 R3） */
+export const SUED_OFF_CAMBER: ReadonlyArray<readonly [number, number, number]> = [
+  [1104, +(1.5 * Math.PI) / 180, 55],
+  [3320, +(1.5 * Math.PI) / 180, 55],
+  [3512, +(1.5 * Math.PI) / 180, 55],
+  [5279, +(1.5 * Math.PI) / 180, 60]
+];
+
 /** 高程剖面：按弧长 s（米）与总长 L（米）返回世界 y 高程（米） */
 export type ElevationProfile = (s: number, L: number) => number;
 
@@ -111,7 +136,9 @@ function bumpAt(s: number, center: number, width: number): number {
 
 /**
  * 高程：低频起伏 + 四处地标包（Hohe Acht 最高点 / Fuchsröhre 下坡 /
- * Wehrseifen 低点 / Karussell 台地）。全部按弧长定义 ⇒ 闭合天然成立。
+ * Wehrseifen 低点 / Karussell 台地）+ 三处**飞坡 crest**（Flugplatz/Schwedenkreuz/
+ * Pflanzgarten，按几何定位的高速段注入，V40 新增）。全部按弧长定义 ⇒ 闭合天然成立。
+ * ⚠ crest 用 raised-cosine（C1），天然不产生海豚跳（>0.3° 折角）；每加一个包须重跑折角扫描。
  */
 function elevationRaw(s: number, L: number): number {
   const t = (s / L) * TAU;
@@ -120,6 +147,11 @@ function elevationRaw(s: number, L: number): number {
   y -= 17 * bumpAt(s, L * 0.216, 420);
   y -= 9 * bumpAt(s, L * 0.335, 460);
   y += 5 * bumpAt(s, L * 0.404, 260);
+  // ── 飞坡 crest（合成 s，几何定位：Flugplatz/Schwedenkreuz 高速段 s∈[1600,5800]，Pflanzgarten 末段长直）──
+  y += 6 * bumpAt(s, 2100, 240); // Flugplatz（Quiddelbacher Höhe 平缓折叠，单 crest）
+  y += 4.5 * bumpAt(s, 4900, 200); // Schwedenkreuz 轻微单 crest
+  y += 5 * bumpAt(s, 16350, 220); // Pflanzgarten 第一跳
+  y += 7 * bumpAt(s, 16750, 250); // Pflanzgarten 第二跳（楼梯式，更大跌落）
   return y;
 }
 
@@ -223,7 +255,8 @@ export class Nordschleife {
   constructor(
     waypoints: ReadonlyArray<readonly [number, number]> = WAYPOINTS,
     targetLength: number = TRACK_LENGTH,
-    elevation: ElevationProfile = elevationRaw
+    elevation: ElevationProfile = elevationRaw,
+    offCamber: ReadonlyArray<readonly [number, number, number]> = NORTH_OFF_CAMBER
   ) {
     const dense = catmullRomClosed(waypoints, 24);
     const raw = resampleClosed2D(dense, 6000);
@@ -352,7 +385,24 @@ export class Nordschleife {
       return 0;
     };
     for (let i = 0; i < count; i++) {
-      const signed = bankSmooth[i] + karussellBank(i * this.spacing);
+      const sI = i * this.spacing;
+      // Off-camber（反倾斜）覆盖：在候选窗内用 cos² 窗把恒内倾 bankSmooth 换成反向 target，
+      // 窗中心满幅、两端平滑（C1，不引海豚跳）。Drive 的 gripLat 用符号敏感 help=−sign(curv)·sign(bank)
+      // 自动把该段判为「外倾减抓地」，读作反斜易滑。窗口非重叠，取最大权重即唯一。
+      let ocW = 0;
+      let ocTarget = 0;
+      for (let k = 0; k < offCamber.length; k++) {
+        const d = Math.abs(sI - offCamber[k][0]);
+        const hw = offCamber[k][2];
+        const w = d <= hw ? Math.cos((Math.PI / 2) * (d / hw)) ** 2 : 0;
+        if (w > ocW) {
+          ocW = w;
+          ocTarget = offCamber[k][1];
+        }
+      }
+      let signed = bankSmooth[i];
+      if (ocW > 0) signed = signed * (1 - ocW) + ocTarget * ocW;
+      signed += karussellBank(sI);
       bank[i] = signed;
       if (signed !== 0) {
         const c = Math.cos(signed);
